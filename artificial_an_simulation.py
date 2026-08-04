@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.special import exp1
 
 # ====================================
 # 적응형 AN 전력 할당 시뮬레이션
@@ -24,8 +25,36 @@ SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
 NT = 2              # 송신 안테나 수 (현 공식은 2로 고정된 경우에 한정됨, TODO: 이후 N_t > 2인 경우로 확장 예정)
 
 FIXED_PHI = 0.5     # 전력비 고정 기법의 전력비
-PHI_MAX = 0.99      # phi 탐색 상한 (1.0의 경우 신호 전력이 0이므로 제외)
+PHI_MAX = 0.99      # phi 탐색 상한 (1.0인 경우 신호 전력이 0이므로 제외)
+
+EG_QUAD_N = 400     # E_g[Ce]의 Y(AN 성분) 수치적분 격자점 수
+EG_QUAD_YMAX = 60.0 # Y 적분 상한 (Exp(1) tail, e^{-60}은 무시 가능)
 # ------------------------------------
+
+
+def _stable_exp_e1(z):
+    # e^z * E1(z). z가 크면 exp 오버플로 -> 점근급수로 대체
+    z = np.asarray(z, dtype=float)
+    out = np.empty_like(z)
+    small = z < 30
+    out[small] = np.exp(z[small]) * exp1(z[small])
+    zl = z[~small]
+    out[~small] = (1/zl) * (1 - 1/zl + 2/zl**2 - 6/zl**3 + 24/zl**4)
+    return out
+
+
+def ergodic_E_Ce(phi_grid, rho):
+    # E_g[Ce](phi) 를 phi_grid 전체에 대해 계산 (bps/Hz)
+    # Nt = 2에서 Eve의 신호 / AN 이득이 지수분포를 따름을 이용해 신호 성분은 지수적분(E1)으로 해석적으로 처리하고 AN 성분만 수치적분
+    # h와 무관하므로 SNR당 1회만 계산
+    y = np.linspace(0.0, EG_QUAD_YMAX, EG_QUAD_N)[None, :]      # [1, Qy]
+    wy = np.exp(-y)                                             # Exp(1) 가중치
+    one_minus = (1.0 - phi_grid)[:, None]                       # [G, 1]
+    c = rho * one_minus / (1.0 + rho * phi_grid[:, None] * y)   # [G, Qy]
+    c = np.maximum(c, 1e-15)
+    integrand = _stable_exp_e1(1.0 / c) * wy                    # [G, Qy], nat(자연로그) 단위
+    E_nat = np.trapezoid(integrand, y[0], axis=1)               # [G]
+    return E_nat / np.log(2.0)                                  # 자연로그 기준(nat)을 log2 기준(bps/Hz)으로 변환
 
 
 def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
@@ -83,15 +112,14 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
         cs_genie = Cs_mat[np.arange(num_samples), idx_genie]    # 해당 위치의 Cs 값
         phi_genie = phi_grid[idx_genie]                         # 해당 위치의 phi 값
 
-        # ===== (3) Proposed: g 미사용, 조건부 SOP 최소화로 phi 선택 (제안 기법) =====
-        A = Kb[:, None]                             # Bob 유효 SNR 계수 [N,1]
-        gth = (1 + A * one_minus) / (2.0**Rs) - 1   # Eve 요구 SINR 임계값 [N,G]
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            a_term = gth / (rho * one_minus)                # SOP 지수 항
-            b_term = gth * phi_grid[None, :] / one_minus    # SOP 분모 항
-            sop_grid = np.exp(-a_term) / (1 + b_term)       # 조건부 SOP [N,G]
-        sop_grid = np.where(gth <= 0, 1.0, sop_grid)    # Bob이 Rs 미달 시 중단
-        idx_proposed = np.argmin(sop_grid, axis=1)      # SOP 최소화 phi 위치
+        # ===== (3) Proposed: Eve CSI(g) 미사용, 조건부 Ergodic Cs 최대화로 phi 선택 =====
+        # h는 알고(순시), g만 분포로 처리 -> 목적함수: E_g[Cs(phi) | h]
+        #   Cb(phi|h) = log2(1 + Kb(1-phi))  : h로 직접 (g 무관)
+        #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
+        E_Ce = ergodic_E_Ce(phi_grid, rho)              # [G], h 무관하여 공유
+        Cb_grid = np.log2(1 + Kb[:, None] * one_minus)  # [N,G] Bob 용량 (h별)
+        cs_erg = np.maximum(0.0, Cb_grid - E_Ce[None, :])  # 조건부 Ergodic Cs [N,G]
+        idx_proposed = np.argmax(cs_erg, axis=1)        # Ergodic Cs 최대화 phi 위치
         phi_proposed = phi_grid[idx_proposed]
         cs_proposed = Cs_mat[np.arange(num_samples), idx_proposed]  # 실현 성능: blind 선택 phi를 실제 g 위에서 평가
 
