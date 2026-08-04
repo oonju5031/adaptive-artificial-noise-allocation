@@ -50,3 +50,20 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+### macOS
+.DS_Store
+
+### IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+### Simulation outputs (재생성 가능하므로 추적 제외)
+# 논문용 최종 그림만 남기려면: git add -f figures/<name>.png
+*.png
+*.pdf
+*.npy
+*.npz
+results/
+figures/
