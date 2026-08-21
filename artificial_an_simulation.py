@@ -29,6 +29,10 @@ PHI_MAX = 0.99      # phi 탐색 상한 (1.0인 경우 신호 전력이 0이므�
 
 EG_QUAD_N = 400     # E_g[Ce]의 Y(AN 성분) 수치적분 격자점 수
 EG_QUAD_YMAX = 60.0 # Y 적분 상한 (Exp(1) tail, e^{-60}은 무시 가능)
+
+NEWTON_MAX_ITER = 20    # 뉴턴법 최대 반복 수
+NEWTON_TOL = 1e-7       # 뉴턴법 step 크기
+PHI_MAX_NEWTON = 0.9    # 뉴턴 적용 영역 상한 (해당 범위 외 극단은 grid 사용)
 # ------------------------------------
 
 
@@ -43,18 +47,67 @@ def _stable_exp_e1(z):
     return out
 
 
-def ergodic_E_Ce(phi_grid, rho):
+def ergodic_E_Ce(phi_grid, rho, derivs=False):
     # E_g[Ce](phi) 를 phi_grid 전체에 대해 계산 (bps/Hz)
     # Nt = 2에서 Eve의 신호 / AN 이득이 지수분포를 따름을 이용해 신호 성분은 지수적분(E1)으로 해석적으로 처리하고 AN 성분만 수치적분
     # h와 무관하므로 SNR당 1회만 계산
+    # derivs=True 이면 phi에 대한 1·2계 해석적 도함수도 함께 반환 (뉴턴법용)
     y = np.linspace(0.0, EG_QUAD_YMAX, EG_QUAD_N)[None, :]      # [1, Qy]
     wy = np.exp(-y)                                             # Exp(1) 가중치
     one_minus = (1.0 - phi_grid)[:, None]                       # [G, 1]
     c = rho * one_minus / (1.0 + rho * phi_grid[:, None] * y)   # [G, Qy]
     c = np.maximum(c, 1e-15)
-    integrand = _stable_exp_e1(1.0 / c) * wy                    # [G, Qy], nat(자연로그) 단위
-    E_nat = np.trapezoid(integrand, y[0], axis=1)               # [G]
-    return E_nat / np.log(2.0)                                  # 자연로그 기준(nat)을 log2 기준(bps/Hz)으로 변환
+    Fu = _stable_exp_e1(1.0 / c)                               # F(u)=e^u E1(u), u=1/c [G,Qy]
+    E_nat = np.trapezoid(Fu * wy, y[0], axis=1)                # [G]
+    E_Ce = E_nat / np.log(2.0)                                 # nat -> bps/Hz
+    if not derivs:
+        return E_Ce
+
+    # phi 도함수
+    u = 1.0 / c                                         # [G,Qy]
+    up = (1.0 + rho * y) / (rho * one_minus**2)         # u'(phi)  [G,Qy]
+    upp = 2.0 * (1.0 + rho * y) / (rho * one_minus**3)  # u''(phi) [G,Qy]
+    Fp = Fu - 1.0 / u                                   # F'(u)
+    Fpp = Fu - 1.0 / u + 1.0 / u**2                     # F''(u)
+    dE = np.trapezoid((Fp * up) * wy, y[0], axis=1) / np.log(2.0)                   # E_Ce'(phi) [G]
+    d2E = np.trapezoid((Fpp * up**2 + Fp * upp) * wy, y[0], axis=1) / np.log(2.0)   # E_Ce''(phi) [G]
+    return E_Ce, dE, d2E
+
+
+def optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce):
+    # 조건부 Ergodic Cs를 최대화하는 phi를 채널별로 탐색
+    # 하이브리드 방식: 뉴턴법을 적용하되, 극단은 grid로 보호
+    # E_Ce 계열은 phi_grid 위 사전계산값 -> 뉴턴 중 격자 선형보간으로 연속 평가
+    ln2 = np.log(2.0); N = len(Kb)
+
+    # Grid: 안전장치 및 뉴턴법 초기값
+    one_minus = (1.0 - phi_grid)[None, :]
+    Cb_grid = np.log(1.0 + Kb[:, None] * one_minus) / ln2       # [N,G]
+    cs_grid = np.maximum(0.0, Cb_grid - E_Ce[None, :])          # [N,G]
+    idx_grid = np.argmax(cs_grid, axis=1)
+    phi_grid_star = phi_grid[idx_grid]                          # grid 해 [N]
+
+    # 뉴턴법: grid 해에서 출발해 관심영역 내에서 정밀화, 벡터화 적용
+    phi = phi_grid_star.copy()
+    for _ in range(NEWTON_MAX_ITER):
+        within = (phi > 1e-4) & (phi < PHI_MAX_NEWTON)         # 관심영역만 갱신
+        d = 1.0 + Kb * (1.0 - phi)
+        Cbp = (-Kb / d) / ln2
+        Cbpp = (-Kb**2 / d**2) / ln2
+        csp = Cbp - np.interp(phi, phi_grid, dE_Ce)            # Cs_bar'
+        cspp = Cbpp - np.interp(phi, phi_grid, d2E_Ce)         # Cs_bar''
+        step = np.where(np.abs(cspp) > 1e-12, csp / cspp, 0.0)
+        phi_new = np.clip(phi - step, 1e-4, PHI_MAX_NEWTON)
+        phi = np.where(within, phi_new, phi)
+        if np.max(np.abs(np.where(within, step, 0.0))) < NEWTON_TOL:
+            break
+
+    # 뉴턴 해 평가 후 grid와 비교해 더 나은 쪽 채택
+    d = 1.0 + Kb * (1.0 - phi)
+    cs_newton = np.maximum(0.0, np.log(d) / ln2 - np.interp(phi, phi_grid, E_Ce))
+    cs_grid_best = cs_grid[np.arange(N), idx_grid]
+    phi_star = np.where(cs_newton >= cs_grid_best, phi, phi_grid_star)
+    return phi_star
 
 
 def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
@@ -116,12 +169,12 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
         # h는 알고(순시), g만 분포로 처리 -> 목적함수: E_g[Cs(phi) | h]
         #   Cb(phi|h) = log2(1 + Kb(1-phi))  : h로 직접 (g 무관)
         #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
-        E_Ce = ergodic_E_Ce(phi_grid, rho)              # [G], h 무관하여 공유
-        Cb_grid = np.log2(1 + Kb[:, None] * one_minus)  # [N,G] Bob 용량 (h별)
-        cs_erg = np.maximum(0.0, Cb_grid - E_Ce[None, :])  # 조건부 Ergodic Cs [N,G]
-        idx_proposed = np.argmax(cs_erg, axis=1)        # Ergodic Cs 최대화 phi 위치
-        phi_proposed = phi_grid[idx_proposed]
-        cs_proposed = Cs_mat[np.arange(num_samples), idx_proposed]  # 실현 성능: blind 선택 phi를 실제 g 위에서 평가
+        # 오목성 분석에 근거한 하이브리드(기본 뉴턴 + 극단 grid)로 최적화.
+        E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho, derivs=True)  # [G]×3, h 무관하여 공유
+        phi_proposed = optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
+        # 실현 성능: blind 선택한 phi를 실제 g 위에서 평가 (phi는 격자 밖일 수 있어 직접 계산)
+        sinr_e_prop = (Kes * (1 - phi_proposed)) / (1 + Kez * phi_proposed)
+        cs_proposed = np.maximum(0.0, np.log2(1 + Kb * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
 
         # ----- SNR별 지표 집계 -----
         res["snr"].append(snr_db)
@@ -145,26 +198,30 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
 
 
 def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
-    snr = res["snr"]
+    snr = np.array(res["snr"])
     floor = max(1.0 / num_samples, 1e-6)  # semilogy에서 0 방지용 바닥값
 
-    plt.figure(figsize=(18, 5))
+    # 색상·스타일 상수 (기법별 통일)
+    C_FIX, C_GEN, C_PRO = "#f59e0b", "#10b981", "#3b82f6"
 
-    # ----- 송신 SNR에 따른 평균 보안 용량 -----
-    plt.subplot(1, 3, 1)
-    plt.plot(snr, res["cs_fixed"], "o-", color="#f59e0b", label="Fixed (phi=0.5)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
-    plt.plot(snr, res["cs_genie"], "^-", color="#10b981", label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
-    plt.plot(snr, res["cs_proposed"], "s--", color="#3b82f6", label="Proposed (No Eve CSI)", linewidth=2, zorder=2)
+    plt.figure(figsize=(13, 10))
+
+    # ===== (1) 송신 SNR에 따른 평균 보안 용량 =====
+    plt.subplot(2, 2, 1)
+    plt.plot(snr, res["cs_fixed"], "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
+    plt.plot(snr, res["cs_genie"], "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
+    plt.plot(snr, res["cs_proposed"], "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=2)
     plt.xlabel("Average Transmit SNR (dB)")
     plt.ylabel("Ergodic Secrecy Capacity (bps/Hz)")
     plt.title("Ergodic Secrecy Capacity")
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.legend()
 
-    # ----- 송신 SNR에 따른 전력 분배 비율 phi -----
-    plt.subplot(1, 3, 2)
-    plt.plot(snr, res["phi_genie"], "v--", color="#10b981", label="Genie-aided", linewidth=1.5)
-    plt.plot(snr, res["phi_proposed"], "D-", color="#3b82f6", label="Proposed (No Eve CSI)", linewidth=2)
+    # ===== (2) 송신 SNR에 따른 전력 분배 비율 phi =====
+    plt.subplot(2, 2, 2)
+    plt.axhline(FIXED_PHI, color=C_FIX, linestyle="-", linewidth=1.6, label="Fixed (phi=0.5)", zorder=1)
+    plt.plot(snr, res["phi_genie"], "v--", color=C_GEN, label="Genie-aided", linewidth=1.5, zorder=2)
+    plt.plot(snr, res["phi_proposed"], "D-", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=3)
     plt.xlabel("Average Transmit SNR (dB)")
     plt.ylabel("Average Optimal Power Ratio (phi*)")
     plt.title("AN Power Allocation Strategy")
@@ -172,13 +229,23 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.legend()
 
-    # ----- 송신 SNR에 따른 보안 중단 확률(Log Scale) -----
-    plt.subplot(1, 3, 3)
-    plt.semilogy(snr, np.maximum(res["sop_fixed"], floor), "o-", color="#f59e0b", label="Fixed (phi=0.5)", linewidth=1.8, zorder=2)
-    plt.semilogy(snr, np.maximum(res["sop_genie"], floor), "^-", color="#10b981", label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
-    plt.semilogy(
-        snr, np.maximum(res["sop_proposed"], floor), "s--", color="#1e3a8a", label="Proposed (No Eve CSI)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3
-    )
+    # ===== (3) 상한선 대비 보안 용량 격차 =====
+    gap_proposed = np.array(res["cs_genie"]) - np.array(res["cs_proposed"])
+    gap_fixed = np.array(res["cs_genie"]) - np.array(res["cs_fixed"])
+    plt.subplot(2, 2, 3)
+    plt.plot(snr, gap_fixed, "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, markersize=6, markerfacecolor="white", markeredgewidth=1.5)
+    plt.plot(snr, gap_proposed, "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2)
+    plt.xlabel("Average Transmit SNR (dB)")
+    plt.ylabel("Capacity Gap from Genie (bps/Hz)")
+    plt.title("Gap to Upper Bound (lower = closer)")
+    plt.grid(True, linestyle=":", alpha=0.7)
+    plt.legend()
+
+    # ===== (4) 송신 SNR에 따른 보안 중단 확률(Log Scale) =====
+    plt.subplot(2, 2, 4)
+    plt.semilogy(snr, np.maximum(res["sop_fixed"], floor), "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, zorder=2)
+    plt.semilogy(snr, np.maximum(res["sop_genie"], floor), "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
+    plt.semilogy(snr, np.maximum(res["sop_proposed"], floor), "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
     plt.xlabel("Average Transmit SNR (dB)")
     plt.ylabel("SOP (Log Scale)")
     plt.title(f"Secrecy Outage Probability (Rs={Rs})")
