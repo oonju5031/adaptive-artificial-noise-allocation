@@ -92,15 +92,16 @@ def ergodic_E_Ce(phi_grid, rho_e, derivs=False):
     return E_Ce, dE, d2E
 
 
-def optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce):
-    # 조건부 Ergodic Cs를 최대화하는 phi를 채널별로 탐색
+def optimize_proposed_hybrid(A, phi_grid, E_Ce, dE_Ce, d2E_Ce):
+    # 목적함수 [Cb(phi|h) - E_g[Ce](phi)]^+ 를 채널별로 최대화
+    #   (조건부 에르고딕 보안 용량 E_g[[Cb-Ce]^+ | h]의 하한)
     # 하이브리드 방식: 뉴턴법을 적용하되, 극단은 grid로 보호
     # E_Ce 계열은 phi_grid 위 사전계산값 -> 뉴턴 중 격자 선형보간으로 연속 평가
-    ln2 = np.log(2.0); N = len(Kb)
+    ln2 = np.log(2.0); N = len(A)
 
     # Grid: 안전장치 및 뉴턴법 초기값
     one_minus = (1.0 - phi_grid)[None, :]
-    Cb_grid = np.log(1.0 + Kb[:, None] * one_minus) / ln2       # [N,G]
+    Cb_grid = np.log(1.0 + A[:, None] * one_minus) / ln2        # [N,G]
     cs_grid = np.maximum(0.0, Cb_grid - E_Ce[None, :])          # [N,G]
     idx_grid = np.argmax(cs_grid, axis=1)
     phi_grid_star = phi_grid[idx_grid]                          # grid 해 [N]
@@ -109,9 +110,9 @@ def optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce):
     phi = phi_grid_star.copy()
     for _ in range(NEWTON_MAX_ITER):
         within = (phi > 1e-4) & (phi < PHI_MAX_NEWTON)         # 관심영역만 갱신
-        d = 1.0 + Kb * (1.0 - phi)
-        Cbp = (-Kb / d) / ln2
-        Cbpp = (-Kb**2 / d**2) / ln2
+        d = 1.0 + A * (1.0 - phi)
+        Cbp = (-A / d) / ln2
+        Cbpp = (-A**2 / d**2) / ln2
         csp = Cbp - np.interp(phi, phi_grid, dE_Ce)            # Cs_bar'
         cspp = Cbpp - np.interp(phi, phi_grid, d2E_Ce)         # Cs_bar''
         step = np.where(np.abs(cspp) > 1e-12, csp / cspp, 0.0)
@@ -121,7 +122,7 @@ def optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce):
             break
 
     # 뉴턴 해 평가 후 grid와 비교해 더 나은 쪽 채택
-    d = 1.0 + Kb * (1.0 - phi)
+    d = 1.0 + A * (1.0 - phi)
     cs_newton = np.maximum(0.0, np.log(d) / ln2 - np.interp(phi, phi_grid, E_Ce))
     cs_grid_best = cs_grid[np.arange(N), idx_grid]
     phi_star = np.where(cs_newton >= cs_grid_best, phi, phi_grid_star)
@@ -146,7 +147,7 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         # 송신 SNR은 Bob 잡음 분산 기준: rho_b = P_total / sigma_b^2
         P_total = (10 ** (snr_db / 10)) * sigma_b2  # dB -> 선형 총 송신 전력
         rho_b = P_total / sigma_b2                  # Bob 기준 송신 SNR
-        rho_e = P_total / sigma_e2                  # Eve 기준 송신 SNR
+        rho_e = P_total / sigma_e2                  # Eve 기준 송신 SNR (등분산 설정 시 rho_b와 동일)
 
         # ----- h, g ~ CN(0, I) 독립 Rayleigh 채널. 배열 [N, Nt]의 각 행이 Nt x 1 열벡터 하나 -----
         h = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Bob 채널
@@ -160,20 +161,20 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         w_z = np.stack([-np.conj(h[:, 1]), np.conj(h[:, 0])], axis=1) / norm_h
         _check_beamformers(h, w_s, w_z)
 
-        # ----- 유효 채널 이득 계수 -----
+        # ----- 유효 채널 이득 -----
         hw_s = hdot(h, w_s)  # h^H w_s (= ||h||)
         gw_s = hdot(g, w_s)  # g^H w_s : Eve의 수신 신호 성분
         gw_z = hdot(g, w_z)  # g^H w_z : Eve의 수신 AN 성분
 
-        Kb = rho_b * np.abs(hw_s) ** 2    # Bob 유효 SNR 계수 [N]
-        Kes = rho_e * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]
-        Kez = rho_e * np.abs(gw_z) ** 2   # Eve AN 방해 이득 [N]
+        A = rho_b * np.abs(hw_s) ** 2   # Bob 유효 채널 이득 [N]
+        B = rho_e * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]  (= rho_e X)
+        D = rho_e * np.abs(gw_z) ** 2   # Eve AN 방해 이득 [N] (= rho_e Y)
 
         one_minus = (1.0 - phi_grid)[None, :]  # (1 - phi) 브로드캐스트용 [1, G]
 
         # ----- 채널 × phi 조합별 실현 보안 용량 Cs [N, G] -----
-        Cb_mat = np.log2(1 + Kb[:, None] * one_minus)  # Bob 용량
-        sinr_e = (Kes[:, None] * one_minus) / (1 + Kez[:, None] * phi_grid[None, :])
+        Cb_mat = np.log2(1 + A[:, None] * one_minus)  # Bob 용량
+        sinr_e = (B[:, None] * one_minus) / (1 + D[:, None] * phi_grid[None, :])
         Ce_mat = np.log2(1 + sinr_e)  # Eve 용량
         Cs_mat = np.maximum(0.0, Cb_mat - Ce_mat)  # 보안 용량 (음수는 0으로 clip)
 
@@ -187,15 +188,15 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         phi_genie = phi_grid[idx_genie]                         # 해당 위치의 phi 값
 
         # ===== (3) Proposed: Eve CSI(g) 미사용, 조건부 Ergodic Cs 최대화로 phi 선택 =====
-        # h는 알고(순시), g만 분포로 처리 -> 목적함수: E_g[Cs(phi) | h]
-        #   Cb(phi|h) = log2(1 + Kb(1-phi))  : h로 직접 (g 무관)
+        # h는 알고(순시), g만 분포로 처리 -> 목적함수: [Cb(phi|h) - E_g[Ce](phi)]^+
+        #   Cb(phi|h) = log2(1 + A(1-phi))   : h로 직접 (g 무관)
         #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
         # 오목성 분석에 근거한 하이브리드(기본 뉴턴 + 극단 grid)로 최적화.
         E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho_e, derivs=True)  # [G]×3, h 무관하여 공유
-        phi_proposed = optimize_proposed_hybrid(Kb, rho_b, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
+        phi_proposed = optimize_proposed_hybrid(A, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
         # 실현 성능: blind 선택한 phi를 실제 g 위에서 평가 (phi는 격자 밖일 수 있어 직접 계산)
-        sinr_e_prop = (Kes * (1 - phi_proposed)) / (1 + Kez * phi_proposed)
-        cs_proposed = np.maximum(0.0, np.log2(1 + Kb * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
+        sinr_e_prop = (B * (1 - phi_proposed)) / (1 + D * phi_proposed)
+        cs_proposed = np.maximum(0.0, np.log2(1 + A * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
 
         # ----- SNR별 지표 집계 -----
         res["snr"].append(snr_db)
@@ -232,7 +233,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.plot(snr, res["cs_fixed"], "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
     plt.plot(snr, res["cs_genie"], "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
     plt.plot(snr, res["cs_proposed"], "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=2)
-    plt.xlabel("Average Transmit SNR (dB)")
+    plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("Ergodic Secrecy Capacity (bps/Hz)")
     plt.title("Ergodic Secrecy Capacity")
     plt.grid(True, linestyle=":", alpha=0.7)
@@ -243,7 +244,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.axhline(FIXED_PHI, color=C_FIX, linestyle="-", linewidth=1.6, label="Fixed (phi=0.5)", zorder=1)
     plt.plot(snr, res["phi_genie"], "v--", color=C_GEN, label="Genie-aided", linewidth=1.5, zorder=2)
     plt.plot(snr, res["phi_proposed"], "D-", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=3)
-    plt.xlabel("Average Transmit SNR (dB)")
+    plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("Average Optimal Power Ratio (phi*)")
     plt.title("AN Power Allocation Strategy")
     plt.ylim(0, 1)
@@ -256,7 +257,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.subplot(2, 2, 3)
     plt.plot(snr, gap_fixed, "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, markersize=6, markerfacecolor="white", markeredgewidth=1.5)
     plt.plot(snr, gap_proposed, "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2)
-    plt.xlabel("Average Transmit SNR (dB)")
+    plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("Capacity Gap from Genie (bps/Hz)")
     plt.title("Gap to Upper Bound (lower = closer)")
     plt.grid(True, linestyle=":", alpha=0.7)
@@ -267,7 +268,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.semilogy(snr, np.maximum(res["sop_fixed"], floor), "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, zorder=2)
     plt.semilogy(snr, np.maximum(res["sop_genie"], floor), "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
     plt.semilogy(snr, np.maximum(res["sop_proposed"], floor), "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
-    plt.xlabel("Average Transmit SNR (dB)")
+    plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("SOP (Log Scale)")
     plt.title(f"Secrecy Outage Probability (Rs={Rs})")
     plt.grid(True, which="both", linestyle=":", alpha=0.7)
