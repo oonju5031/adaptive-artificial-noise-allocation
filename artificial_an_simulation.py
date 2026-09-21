@@ -17,7 +17,8 @@ from scipy.special import exp1
 # ----- HyperParameters --------------
 NUM_SAMPLES = 50000                     # Monte-Carlo 채널 표본 수
 RS = 1.0                                # 목표 보안 전송률 (bps/Hz)
-SIGMA_N2 = 1e-10                        # 수신단 열잡음 분산
+SIGMA_B2 = 1.0                          # Bob 잡음 분산
+SIGMA_E2 = 1.0                          # Eve 잡음 분산(잡음 분산의 경우 두 수신단을 동일하게 두어 성능 차이가 공간적 분리에서만 비롯되도록 통제)
 NUM_PHI = 201                           # Grid search 해상도(정밀도)
 SEED = 0                                # 난수 시드 (재현성)
 SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
@@ -63,8 +64,8 @@ def _stable_exp_e1(z):
     return out
 
 
-def ergodic_E_Ce(phi_grid, rho, derivs=False):
-    # E_g[Ce](phi) 를 phi_grid 전체에 대해 계산 (bps/Hz)
+def ergodic_E_Ce(phi_grid, rho_e, derivs=False):
+    # E_g[Ce](phi) 를 phi_grid 전체에 대해 계산 (bps/Hz). rho_e = P_total / sigma_e^2
     # Nt = 2에서 Eve의 신호 / AN 이득이 지수분포를 따름을 이용해 신호 성분은 지수적분(E1)으로 해석적으로 처리하고 AN 성분만 수치적분
     # h와 무관하므로 SNR당 1회만 계산
     # derivs=True 이면 phi에 대한 1·2계 해석적 도함수도 함께 반환 (뉴턴법용)
@@ -72,7 +73,7 @@ def ergodic_E_Ce(phi_grid, rho, derivs=False):
     y = np.concatenate([[0.0], np.geomspace(1e-6, EG_QUAD_YMAX, EG_QUAD_N - 1)])[None, :]  # [1, Qy]
     wy = np.exp(-y)                                             # Exp(1) 가중치
     one_minus = (1.0 - phi_grid)[:, None]                       # [G, 1]
-    c = rho * one_minus / (1.0 + rho * phi_grid[:, None] * y)   # [G, Qy]
+    c = rho_e * one_minus / (1.0 + rho_e * phi_grid[:, None] * y)   # [G, Qy]
     c = np.maximum(c, 1e-15)
     Fu = _stable_exp_e1(1.0 / c)                               # F(u)=e^u E1(u), u=1/c [G,Qy]
     E_nat = np.trapezoid(Fu * wy, y[0], axis=1)                # [G]
@@ -82,8 +83,8 @@ def ergodic_E_Ce(phi_grid, rho, derivs=False):
 
     # phi 도함수
     u = 1.0 / c                                         # [G,Qy]
-    up = (1.0 + rho * y) / (rho * one_minus**2)         # u'(phi)  [G,Qy]
-    upp = 2.0 * (1.0 + rho * y) / (rho * one_minus**3)  # u''(phi) [G,Qy]
+    up = (1.0 + rho_e * y) / (rho_e * one_minus**2)     # u'(phi)  [G,Qy]
+    upp = 2.0 * (1.0 + rho_e * y) / (rho_e * one_minus**3)  # u''(phi) [G,Qy]
     Fp = Fu - 1.0 / u                                   # F'(u)
     Fpp = Fu - 1.0 / u + 1.0 / u**2                     # F''(u)
     dE = np.trapezoid((Fp * up) * wy, y[0], axis=1) / np.log(2.0)                   # E_Ce'(phi) [G]
@@ -127,7 +128,7 @@ def optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce):
     return phi_star
 
 
-def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
+def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=SIGMA_E2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
     rng = np.random.default_rng(seed)               # 시드 고정 난수 생성기
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
@@ -142,8 +143,10 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
 
     # ----- 수식 계산 -----
     for snr_db in snr_db_range:
-        P_total = (10 ** (snr_db / 10)) * sigma_n2  # dB -> 선형 총 송신 전력 변환
-        rho = P_total / sigma_n2                    # 송신 SNR
+        # 송신 SNR은 Bob 잡음 분산 기준: rho_b = P_total / sigma_b^2
+        P_total = (10 ** (snr_db / 10)) * sigma_b2  # dB -> 선형 총 송신 전력
+        rho_b = P_total / sigma_b2                  # Bob 기준 송신 SNR
+        rho_e = P_total / sigma_e2                  # Eve 기준 송신 SNR
 
         # ----- h, g ~ CN(0, I) 독립 Rayleigh 채널. 배열 [N, Nt]의 각 행이 Nt x 1 열벡터 하나 -----
         h = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Bob 채널
@@ -162,9 +165,9 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
         gw_s = hdot(g, w_s)  # g^H w_s : Eve의 수신 신호 성분
         gw_z = hdot(g, w_z)  # g^H w_z : Eve의 수신 AN 성분
 
-        Kb = rho * np.abs(hw_s) ** 2    # Bob 유효 SNR 계수 [N]
-        Kes = rho * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]
-        Kez = rho * np.abs(gw_z) ** 2   # Eve AN 방해 이득 [N]
+        Kb = rho_b * np.abs(hw_s) ** 2    # Bob 유효 SNR 계수 [N]
+        Kes = rho_e * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]
+        Kez = rho_e * np.abs(gw_z) ** 2   # Eve AN 방해 이득 [N]
 
         one_minus = (1.0 - phi_grid)[None, :]  # (1 - phi) 브로드캐스트용 [1, G]
 
@@ -188,8 +191,8 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
         #   Cb(phi|h) = log2(1 + Kb(1-phi))  : h로 직접 (g 무관)
         #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
         # 오목성 분석에 근거한 하이브리드(기본 뉴턴 + 극단 grid)로 최적화.
-        E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho, derivs=True)  # [G]×3, h 무관하여 공유
-        phi_proposed = optimize_proposed_hybrid(Kb, rho, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
+        E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho_e, derivs=True)  # [G]×3, h 무관하여 공유
+        phi_proposed = optimize_proposed_hybrid(Kb, rho_b, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
         # 실현 성능: blind 선택한 phi를 실제 g 위에서 평가 (phi는 격자 밖일 수 있어 직접 계산)
         sinr_e_prop = (Kes * (1 - phi_proposed)) / (1 + Kez * phi_proposed)
         cs_proposed = np.maximum(0.0, np.log2(1 + Kb * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
