@@ -36,6 +36,22 @@ PHI_MAX_NEWTON = 0.9    # 뉴턴 적용 영역 상한 (해당 범위 외 극단�
 # ------------------------------------
 
 
+def hdot(a, b):
+    # 표본별 켤레전치 내적 a^H b
+    # 이 때 a, b는 [N, Nt] (각 행이 Nt x 1 열벡터 하나)
+    return np.sum(np.conj(a) * b, axis=1)
+
+
+def _check_beamformers(h, w_s, w_z, tol=1e-10):
+    # 모델 가정 검증
+    # 1. w_s, w_z 정규직교 여부
+    # 2. h^H w_z = 0 (영공간)
+    assert np.max(np.abs(np.linalg.norm(w_s, axis=1) - 1)) < tol
+    assert np.max(np.abs(np.linalg.norm(w_z, axis=1) - 1)) < tol
+    assert np.max(np.abs(hdot(w_s, w_z))) < tol, "w_s와 w_z가 직교하지 않음"
+    assert np.max(np.abs(hdot(h, w_z))) < tol, "w_z가 h의 영공간에 있지 않음"
+
+
 def _stable_exp_e1(z):
     # e^z * E1(z). z가 크면 exp 오버플로 -> 점근급수로 대체
     z = np.asarray(z, dtype=float)
@@ -128,21 +144,22 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_n2=SIGMA_N2, snr_db_ran
         P_total = (10 ** (snr_db / 10)) * sigma_n2  # dB -> 선형 총 송신 전력 변환
         rho = P_total / sigma_n2                    # 송신 SNR
 
-        # ----- 각 원소가 CN(0,1)인 Rayleigh 페이딩 채널 [N, Nt] 생성 -----
+        # ----- h, g ~ CN(0, I) 독립 Rayleigh 채널. 배열 [N, Nt]의 각 행이 Nt x 1 열벡터 하나 -----
         h = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Bob 채널
         g = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Eve 채널
 
         norm_h = np.linalg.norm(h, axis=1, keepdims=True)   # 채널별 ||h|| [N,1]
-        w_s = np.conj(h) / norm_h                           # MRT 빔포밍 방향
+        w_s = h / norm_h                                    # MRT: w_s = h / ||h||
 
-        # 영공간 빔포밍 방향 (w_z ⊥ h)
+        # 영공간 빔포밍 방향: h^H w_z = 0, w_s^H w_z = 0
         # (단, 해당 공식은 N_t=2에서만 성립 -> TODO: 이후 N_t > 2인 경우로 확장 예정)
         w_z = np.stack([-np.conj(h[:, 1]), np.conj(h[:, 0])], axis=1) / norm_h
+        _check_beamformers(h, w_s, w_z)
 
         # ----- 유효 채널 이득 계수 -----
-        hw_s = np.sum(h * w_s, axis=1)  # Bob의 수신 신호 성분 (= ||h||)
-        gw_s = np.sum(g * w_s, axis=1)  # Eve의 수신 신호 성분
-        gw_z = np.sum(g * w_z, axis=1)  # Eve의 수신 AN 성분
+        hw_s = hdot(h, w_s)  # h^H w_s (= ||h||)
+        gw_s = hdot(g, w_s)  # g^H w_s : Eve의 수신 신호 성분
+        gw_z = hdot(g, w_z)  # g^H w_z : Eve의 수신 AN 성분
 
         Kb = rho * np.abs(hw_s) ** 2    # Bob 유효 SNR 계수 [N]
         Kes = rho * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]
