@@ -68,7 +68,8 @@ def ergodic_E_Ce(phi_grid, rho, derivs=False):
     # Nt = 2에서 Eve의 신호 / AN 이득이 지수분포를 따름을 이용해 신호 성분은 지수적분(E1)으로 해석적으로 처리하고 AN 성분만 수치적분
     # h와 무관하므로 SNR당 1회만 계산
     # derivs=True 이면 phi에 대한 1·2계 해석적 도함수도 함께 반환 (뉴턴법용)
-    y = np.linspace(0.0, EG_QUAD_YMAX, EG_QUAD_N)[None, :]      # [1, Qy]
+    # 고 SNR에서 피적분함수가 y=0 근처에서 급변하므로 원점 근처를 촘촘히 배치 (비균일 격자)
+    y = np.concatenate([[0.0], np.geomspace(1e-6, EG_QUAD_YMAX, EG_QUAD_N - 1)])[None, :]  # [1, Qy]
     wy = np.exp(-y)                                             # Exp(1) 가중치
     one_minus = (1.0 - phi_grid)[:, None]                       # [G, 1]
     c = rho * one_minus / (1.0 + rho * phi_grid[:, None] * y)   # [G, Qy]
