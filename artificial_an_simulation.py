@@ -11,6 +11,10 @@ from scipy.special import exp1
 #   - Fixed(전력비 고정 기법)
 #   - Genie-aided(Eve의 CSI를 아는 경우, 성능 상한선)
 #   - Proposed(Eve의 CSI를 모르는 경우)
+# - 평가 지표
+#   - 에르고딕 보안 용량: Genie는 E[[Cb-Ce]^+] (Eve CSI로 블록별 판정 가능)
+#     Fixed, Proposed는 달성 가능 전송률 E[1{전송}(Cb-Ce)] (h만으로 전송 여부 결정, 누설 블록 포함)
+#   - SOP: 블록별 P(Cb - Ce < Rs) (5.6절 닫힌형과 같은 정의)
 # ====================================
 
 
@@ -334,7 +338,7 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
     # ----- 결과 누적용 dictionary -----
-    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac"]}
+    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac", "cs_proposed_ideal", "cs_proposed_obj"]}
 
     # ----- 진행 상황 출력 -----
     print(f"시뮬레이션 시작 (Samples: {num_samples}, Rs: {Rs} bps/Hz)")
@@ -351,33 +355,38 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
 
         A, B, D = generate_gains(rng, num_samples, rho_b, rho_e)   # 식 (3.8)
 
-        # ===== 1. Fixed: 정보 신호와 인공 잡음 신호의 전력비 고정 =====
-        cs_fixed = np.maximum(0.0, f_ch4(FIXED_PHI, A, B, D))
+        # 5장 목적함수의 E_g[Ce]: h 무관 -> SNR당 1회 계산해 Fixed, Proposed가 공유
+        E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho_e, derivs=True)  # [G]×3
+
+        # ===== 1. Fixed: 정보 신호와 인공 잡음 신호의 전력비 고정 (Eve CSI 없음) =====
+        d_fixed = f_ch4(FIXED_PHI, A, B, D)                                   # 블록별 Cb - Ce
+        tx_fixed = np.log2(1 + A * (1 - FIXED_PHI)) - np.interp(FIXED_PHI, phi_grid, E_Ce) > 0  # h만으로 전송 여부
+        cs_fixed = np.where(tx_fixed, d_fixed, 0.0)                           # 달성 가능 (음수 블록 포함)
 
         # ===== 2. Genie-aided: Eve의 CSI를 알고 4장 조건부 하이브리드로 phi 선택 =====
         phi_genie, n_eval_genie, safe = optimize_genie_hybrid(A, B, D)
-        cs_genie = np.maximum(0.0, f_ch4(phi_genie, A, B, D))
+        d_genie = f_ch4(phi_genie, A, B, D)
+        cs_genie = np.maximum(0.0, d_genie)                                   # Eve CSI로 블록별 판정 가능
 
-        # ===== (3) Proposed: Eve CSI(g) 미사용, 조건부 Ergodic Cs 최대화로 phi 선택 =====
-        # h는 알고(순시), g만 분포로 처리 -> 목적함수: [Cb(phi|h) - E_g[Ce](phi)]^+
-        #   Cb(phi|h) = log2(1 + A(1-phi))   : h로 직접 (g 무관)
-        #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
-        # 경계 판정(닫힌형) + 안전장치 뉴턴법, 예외 시 그리드로 최적화 (5.4, 5.5절)
-        E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho_e, derivs=True)  # [G]×3, h 무관하여 공유
-        phi_proposed, n_eval_prop, an_off, _ = optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
-        # 실현 성능: blind 선택한 phi를 실제 g 위에서 평가 (phi는 격자 밖일 수 있어 직접 계산)
-        sinr_e_prop = (B * (1 - phi_proposed)) / (1 + D * phi_proposed)
-        cs_proposed = np.maximum(0.0, np.log2(1 + A * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
+        # ===== 3. Proposed: Eve CSI(g) 미사용, 5장 목적함수 최대화로 phi 선택 =====
+        # 목적함수 C_bar(phi) = Cb(phi|h) - E_g[Ce](phi), 경계 판정(닫힌형) + 안전장치 뉴턴법 (5.4, 5.5절)
+        phi_proposed, n_eval_prop, an_off, _ = optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce)
+        d_prop = f_ch4(phi_proposed, A, B, D)                                 # 실제 g 위에서의 블록별 Cb - Ce
+        c_bar_prop = np.log2(1 + A * (1 - phi_proposed)) - np.interp(phi_proposed, phi_grid, E_Ce)
+        tx_prop = c_bar_prop > 0                                              # h만으로 전송 여부
+        cs_proposed = np.where(tx_prop, d_prop, 0.0)                          # 달성 가능 (음수 블록 포함)
 
         # ----- SNR별 지표 집계 -----
         res["snr"].append(snr_db)
-        res["cs_fixed"].append(cs_fixed.mean())  # 평균(ergodic) 보안 용량
+        res["cs_fixed"].append(cs_fixed.mean())          # 에르고딕 보안 용량 (Fixed, Proposed: 달성 가능 전송률)
         res["cs_genie"].append(cs_genie.mean())
         res["cs_proposed"].append(cs_proposed.mean())
-        res["sop_fixed"].append(np.mean(cs_fixed < Rs))  # SOP = P(Cs < Rs)
-        res["sop_genie"].append(np.mean(cs_genie < Rs))
-        res["sop_proposed"].append(np.mean(cs_proposed < Rs))
-        res["phi_genie"].append(phi_genie.mean())  # 평균 선택 phi
+        res["cs_proposed_ideal"].append(np.maximum(0.0, d_prop).mean())  # 참고: Eve CSI가 있어야 가능한 블록별 판정
+        res["cs_proposed_obj"].append(np.maximum(0.0, c_bar_prop).mean())  # 참고: 목적함수 값 평균 (달성 가능값의 해석 추정)
+        res["sop_fixed"].append(np.mean(d_fixed < Rs))   # SOP = P(Cb - Ce < Rs)
+        res["sop_genie"].append(np.mean(d_genie < Rs))
+        res["sop_proposed"].append(np.mean(d_prop < Rs))
+        res["phi_genie"].append(phi_genie.mean())        # 평균 선택 phi
         res["phi_proposed"].append(phi_proposed.mean())
         res["evals_genie"].append(n_eval_genie.mean())   # Genie 결정당 평균 평가 횟수
         res["safe_frac"].append(safe.mean())             # 안전 구간(D > B/2) 비율
@@ -409,8 +418,8 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.plot(snr, res["cs_genie"], "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
     plt.plot(snr, res["cs_proposed"], "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=2)
     plt.xlabel("Transmit SNR (dB)")
-    plt.ylabel("Ergodic Secrecy Capacity (bps/Hz)")
-    plt.title("Ergodic Secrecy Capacity")
+    plt.ylabel("Ergodic Secrecy Rate (bps/Hz)")
+    plt.title("Ergodic Secrecy Rate")
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.legend()
 
