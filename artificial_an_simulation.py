@@ -17,8 +17,8 @@ from scipy.special import exp1
 # ----- HyperParameters --------------
 NUM_SAMPLES = 50000                     # Monte-Carlo 채널 표본 수
 RS = 1.0                                # 목표 보안 전송률 (bps/Hz)
-SIGMA_B2 = 1.0                          # Bob 잡음 분산
-SIGMA_E2 = 1.0                          # Eve 잡음 분산(잡음 분산의 경우 두 수신단을 동일하게 두어 성능 차이가 공간적 분리에서만 비롯되도록 통제)
+SIGMA_B2 = 1.0                          # Bob 잡음 분산 (모의실험 설정: Eve와 동일)
+SIGMA_E2 = 1.0                          # Eve 잡음 분산
 NUM_PHI = 201                           # Grid search 해상도(정밀도)
 SEED = 0                                # 난수 시드 (재현성)
 SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
@@ -34,6 +34,13 @@ EG_QUAD_YMAX = 60.0 # Y 적분 상한 (Exp(1) tail, e^{-60}은 무시 가능)
 NEWTON_MAX_ITER = 20    # 뉴턴법 최대 반복 수
 NEWTON_TOL = 1e-7       # 뉴턴법 step 크기
 PHI_MAX_NEWTON = 0.9    # 뉴턴 적용 영역 상한 (해당 범위 외 극단은 grid 사용)
+
+# 4장 조건부 하이브리드 (Genie-aided)
+CH4_COARSE_N = 11       # 불확실 구간(D <= B/2)의 거친 그리드 점 수
+CH4_NEWTON_INIT = 0.3   # 안전 구간(D > B/2)의 뉴턴법 초기값
+CH4_MAX_ITER = 50       # 안전장치 뉴턴법 최대 반복 수 (이분법 대체 포함)
+CH4_TOL = 1e-9          # 안전장치 뉴턴법 수렴 판정 (phi 변화량)
+CH4_GTOL = 1e-12        # 안전장치 뉴턴법 수렴 판정 (|f'| 크기)
 # ------------------------------------
 
 
@@ -62,6 +69,140 @@ def _stable_exp_e1(z):
     zl = z[~small]
     out[~small] = (1/zl) * (1 - 1/zl + 2/zl**2 - 6/zl**3 + 24/zl**4)
     return out
+
+
+def f_ch4(phi, A, B, D):
+    # 식 (3.14): f(phi) = Cb(phi) - Ce(phi)  [bps/Hz]
+    return (np.log1p(A * (1 - phi)) - np.log1p(B * (1 - phi) / (1 + D * phi))) / np.log(2.0)
+
+
+def df_ch4(phi, A, B, D):
+    # f'(phi)
+    return (-A / (1 + A * (1 - phi))
+            - ((D - B) / (1 + B + (D - B) * phi) - D / (1 + D * phi))) / np.log(2.0)
+
+
+def d2f_ch4(phi, A, B, D):
+    # f''(phi) (4장의 오목성 분석 식)
+    return (-A**2 / (1 + A * (1 - phi))**2
+            + (D - B)**2 / (1 + B + (D - B) * phi)**2
+            - D**2 / (1 + D * phi)**2) / np.log(2.0)
+
+
+def _safeguarded_newton(lo, hi, p0, A, B, D, max_iter=CH4_MAX_ITER, tol=CH4_TOL):
+    # 전제: f'(lo) > 0 > f'(hi) 인 구간 [lo, hi] 안의 정지점 탐색
+    # 뉴턴 스텝이 구간을 벗어나거나 f'' >= 0 이면 이분법 스텝으로 대체 -> 구간이 매 반복 줄어 수렴 보장
+    lo, hi = lo.astype(float).copy(), hi.astype(float).copy()
+    p = np.clip(p0, lo, hi).astype(float)
+    n_eval = np.zeros(len(p))
+    active = np.ones(len(p), dtype=bool)
+    for _ in range(max_iter):
+        if not active.any():
+            break
+        g, h = df_ch4(p, A, B, D), d2f_ch4(p, A, B, D)
+        n_eval += active                                  # 반복당 f', f'' 1회 평가
+        stationary = np.abs(g) < CH4_GTOL                 # 이미 정지점이면 그대로 종료
+        lo = np.where(active & (g > 0), p, lo)            # 정지점은 f'>0 쪽의 오른쪽
+        hi = np.where(active & (g <= 0), p, hi)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_new = np.where(h < 0, p - g / h, np.nan)
+        bad = ~((p_new >= lo) & (p_new <= hi))            # 경계 포함 판정 (NaN은 bad)
+        p_new = np.where(bad, 0.5 * (lo + hi), p_new)
+        done = stationary | (np.abs(p_new - p) < tol)
+        p = np.where(active & ~stationary, p_new, p)
+        active &= ~done
+    return p, n_eval
+
+
+def optimize_genie_hybrid(A, B, D):
+    # 4장 조건부 하이브리드: Eve의 순시 CSI(B, D)를 아는 경우 f(phi)를 채널별로 최대화
+    #   안전 구간 (D > B/2): f가 [0,1]에서 오목 -> 경계 판정 후 뉴턴법만 사용
+    #   불확실 구간 (D <= B/2): 거친 그리드로 후보를 찾고 이웃 구간에서 뉴턴법으로 정밀화, 그리드 최선과 비교
+    # 반환: phi*, 채널별 평가 횟수(f 또는 f'/f'' 계산 횟수), 안전 구간 여부
+    N = len(A)
+    phi = np.zeros(N); n_eval = np.zeros(N)
+    safe = D > B / 2
+
+    # ----- 안전 구간 -----
+    i = np.where(safe)[0]
+    if len(i):
+        Ai, Bi, Di = A[i], B[i], D[i]
+        at0 = df_ch4(np.zeros(len(i)), Ai, Bi, Di) <= 0          # 오목 + f'(0)<=0 -> phi*=0
+        atM = ~at0 & (df_ch4(np.full(len(i), PHI_MAX), Ai, Bi, Di) >= 0)  # f'(PHI_MAX)>=0 -> 상한
+        n_eval[i] = 1 + (~at0)
+        inner = ~at0 & ~atM
+        p = np.where(at0, 0.0, PHI_MAX)
+        if inner.any():
+            k = np.where(inner)[0]
+            pk, nk = _safeguarded_newton(np.zeros(len(k)), np.full(len(k), PHI_MAX),
+                                         np.full(len(k), CH4_NEWTON_INIT), Ai[k], Bi[k], Di[k])
+            p[k] = pk; n_eval[i[k]] += nk
+        phi[i] = p
+
+    # ----- 불확실 구간 -----
+    j = np.where(~safe)[0]
+    if len(j):
+        Aj, Bj, Dj = A[j], B[j], D[j]
+        coarse = np.linspace(0.0, PHI_MAX, CH4_COARSE_N)
+        V = f_ch4(coarse[None, :], Aj[:, None], Bj[:, None], Dj[:, None])
+        k = np.argmax(V, axis=1)
+        p_grid, v_grid = coarse[k], V[np.arange(len(j)), k]
+        lo = coarse[np.maximum(k - 1, 0)]
+        hi = coarse[np.minimum(k + 1, CH4_COARSE_N - 1)]
+        bracket = (df_ch4(lo, Aj, Bj, Dj) > 0) & (df_ch4(hi, Aj, Bj, Dj) < 0)
+        n_eval[j] = CH4_COARSE_N + 2
+        p = p_grid.copy()
+        if bracket.any():
+            b = np.where(bracket)[0]
+            pb, nb = _safeguarded_newton(lo[b], hi[b], p_grid[b], Aj[b], Bj[b], Dj[b])
+            better = f_ch4(pb, Aj[b], Bj[b], Dj[b]) >= v_grid[b]
+            p[b] = np.where(better, pb, p_grid[b])
+            n_eval[j[b]] += nb + 1
+        phi[j] = p
+
+    # 보안 전송이 불가능한 채널(max f <= 0)은 인공 잡음을 쓸 이유가 없으므로 phi = 0
+    no_secrecy = f_ch4(phi, A, B, D) <= 0
+    n_eval += 1
+    phi = np.where(no_secrecy, 0.0, phi)
+    return phi, n_eval, safe
+
+
+def generate_gains(rng, n, rho_b, rho_e):
+    # h, g ~ CN(0, I) 독립 Rayleigh 채널 생성 후 식 (3.8)의 A, B, D 반환 (Nt=2)
+    h = (rng.standard_normal((n, NT)) + 1j * rng.standard_normal((n, NT))) / np.sqrt(2)
+    g = (rng.standard_normal((n, NT)) + 1j * rng.standard_normal((n, NT))) / np.sqrt(2)
+    norm_h = np.linalg.norm(h, axis=1, keepdims=True)
+    w_s = h / norm_h                                                            # MRT, 식 (3.2)
+    w_z = np.stack([-np.conj(h[:, 1]), np.conj(h[:, 0])], axis=1) / norm_h     # 식 (3.3)
+    _check_beamformers(h, w_s, w_z)
+    A = rho_b * np.abs(hdot(h, w_s)) ** 2
+    B = rho_e * np.abs(hdot(g, w_s)) ** 2
+    D = rho_e * np.abs(hdot(g, w_z)) ** 2
+    return A, B, D
+
+
+def verify_ch4_hybrid(snr_db_list=(0, 10, 20, 30), num_samples=20000, ref_points=20001, seed=1):
+    # 4장 하이브리드 검증: 초정밀 그리드(ref_points) 대비 손실, 201점 그리드와의 비교, 평가 횟수
+    rng = np.random.default_rng(seed)
+    ref = np.linspace(0.0, PHI_MAX, ref_points)
+    g201 = np.linspace(0.0, PHI_MAX, NUM_PHI)
+    print(f"[4장 하이브리드 검증] 표본 {num_samples}, 기준 그리드 {ref_points}점")
+    print(f"{'SNR(dB)':>7} | {'안전구간':>8} | {'손실 평균':>10} | {'손실 최대':>10} | "
+          f"{'201점 최대손실':>13} | {'평가횟수 평균':>12} | {'최대':>4}")
+    for snr_db in snr_db_list:
+        rho = 10 ** (snr_db / 10)
+        A, B, D = generate_gains(rng, num_samples, rho, rho)
+        phi, n_eval, safe = optimize_genie_hybrid(A, B, D)
+        v_h = np.maximum(0, f_ch4(phi, A, B, D))
+        v_ref = np.empty(num_samples); v_201 = np.empty(num_samples)
+        for s0 in range(0, num_samples, 1000):                     # 메모리 절약용 청크
+            sl = slice(s0, s0 + 1000)
+            a, b, d = A[sl, None], B[sl, None], D[sl, None]
+            v_ref[sl] = np.maximum(0, f_ch4(ref[None, :], a, b, d)).max(1)
+            v_201[sl] = np.maximum(0, f_ch4(g201[None, :], a, b, d)).max(1)
+        loss = v_ref - v_h
+        print(f"{snr_db:>7} | {safe.mean():>8.3f} | {loss.mean():>10.1e} | {loss.max():>10.1e} | "
+              f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4}")
 
 
 def ergodic_E_Ce(phi_grid, rho_e, derivs=False):
@@ -134,7 +275,7 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
     # ----- 결과 누적용 dictionary -----
-    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed"]}
+    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac"]}
 
     # ----- 진행 상황 출력 -----
     print(f"시뮬레이션 시작 (Samples: {num_samples}, Rs: {Rs} bps/Hz)")
@@ -149,43 +290,14 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         rho_b = P_total / sigma_b2                  # Bob 기준 송신 SNR
         rho_e = P_total / sigma_e2                  # Eve 기준 송신 SNR (등분산 설정 시 rho_b와 동일)
 
-        # ----- h, g ~ CN(0, I) 독립 Rayleigh 채널. 배열 [N, Nt]의 각 행이 Nt x 1 열벡터 하나 -----
-        h = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Bob 채널
-        g = (rng.standard_normal((num_samples, NT)) + 1j * rng.standard_normal((num_samples, NT))) / np.sqrt(2)  # Eve 채널
-
-        norm_h = np.linalg.norm(h, axis=1, keepdims=True)   # 채널별 ||h|| [N,1]
-        w_s = h / norm_h                                    # MRT: w_s = h / ||h||
-
-        # 영공간 빔포밍 방향: h^H w_z = 0, w_s^H w_z = 0
-        # (단, 해당 공식은 N_t=2에서만 성립 -> TODO: 이후 N_t > 2인 경우로 확장 예정)
-        w_z = np.stack([-np.conj(h[:, 1]), np.conj(h[:, 0])], axis=1) / norm_h
-        _check_beamformers(h, w_s, w_z)
-
-        # ----- 유효 채널 이득 -----
-        hw_s = hdot(h, w_s)  # h^H w_s (= ||h||)
-        gw_s = hdot(g, w_s)  # g^H w_s : Eve의 수신 신호 성분
-        gw_z = hdot(g, w_z)  # g^H w_z : Eve의 수신 AN 성분
-
-        A = rho_b * np.abs(hw_s) ** 2   # Bob 유효 채널 이득 [N]
-        B = rho_e * np.abs(gw_s) ** 2   # Eve 신호 이득 [N]  (= rho_e X)
-        D = rho_e * np.abs(gw_z) ** 2   # Eve AN 방해 이득 [N] (= rho_e Y)
-
-        one_minus = (1.0 - phi_grid)[None, :]  # (1 - phi) 브로드캐스트용 [1, G]
-
-        # ----- 채널 × phi 조합별 실현 보안 용량 Cs [N, G] -----
-        Cb_mat = np.log2(1 + A[:, None] * one_minus)  # Bob 용량
-        sinr_e = (B[:, None] * one_minus) / (1 + D[:, None] * phi_grid[None, :])
-        Ce_mat = np.log2(1 + sinr_e)  # Eve 용량
-        Cs_mat = np.maximum(0.0, Cb_mat - Ce_mat)  # 보안 용량 (음수는 0으로 clip)
+        A, B, D = generate_gains(rng, num_samples, rho_b, rho_e)   # 식 (3.8)
 
         # ===== 1. Fixed: 정보 신호와 인공 잡음 신호의 전력비 고정 =====
-        idx_fixed = int(np.argmin(np.abs(phi_grid - FIXED_PHI)))  # 격자상 최근접 위치
-        cs_fixed = Cs_mat[:, idx_fixed]
+        cs_fixed = np.maximum(0.0, f_ch4(FIXED_PHI, A, B, D))
 
-        # ===== 2. Genie-aided: Eve의 CSI g를 알고 있다고 가정 =====
-        idx_genie = np.argmax(Cs_mat, axis=1)                   # 채널별 최적 phi 위치
-        cs_genie = Cs_mat[np.arange(num_samples), idx_genie]    # 해당 위치의 Cs 값
-        phi_genie = phi_grid[idx_genie]                         # 해당 위치의 phi 값
+        # ===== 2. Genie-aided: Eve의 CSI를 알고 4장 조건부 하이브리드로 phi 선택 =====
+        phi_genie, n_eval_genie, safe = optimize_genie_hybrid(A, B, D)
+        cs_genie = np.maximum(0.0, f_ch4(phi_genie, A, B, D))
 
         # ===== (3) Proposed: Eve CSI(g) 미사용, 조건부 Ergodic Cs 최대화로 phi 선택 =====
         # h는 알고(순시), g만 분포로 처리 -> 목적함수: [Cb(phi|h) - E_g[Ce](phi)]^+
@@ -208,6 +320,8 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         res["sop_proposed"].append(np.mean(cs_proposed < Rs))
         res["phi_genie"].append(phi_genie.mean())  # 평균 선택 phi
         res["phi_proposed"].append(phi_proposed.mean())
+        res["evals_genie"].append(n_eval_genie.mean())   # Genie 결정당 평균 평가 횟수
+        res["safe_frac"].append(safe.mean())             # 안전 구간(D > B/2) 비율
 
         # ----- 현재 SNR 행 콘솔 출력 -----
         print(
@@ -279,5 +393,6 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
 
 
 if __name__ == "__main__":
+    verify_ch4_hybrid()
     results = run_simulation()
     plot_results(results)
