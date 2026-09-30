@@ -31,16 +31,14 @@ PHI_MAX = 0.99      # phi 탐색 상한 (1.0인 경우 신호 전력이 0이므�
 EG_QUAD_N = 400     # E_g[Ce]의 Y(AN 성분) 수치적분 격자점 수
 EG_QUAD_YMAX = 60.0 # Y 적분 상한 (Exp(1) tail, e^{-60}은 무시 가능)
 
-NEWTON_MAX_ITER = 20    # 뉴턴법 최대 반복 수
-NEWTON_TOL = 1e-7       # 뉴턴법 step 크기
-PHI_MAX_NEWTON = 0.9    # 뉴턴 적용 영역 상한 (해당 범위 외 극단은 grid 사용)
+# 안전장치 뉴턴법 (4장, 5장 공통)
+NEWTON_INIT = 0.3       # 뉴턴법 초기값
+NEWTON_MAX_ITER = 50    # 최대 반복 수 (이분법 대체 포함)
+NEWTON_TOL = 1e-9       # 수렴 판정 (phi 변화량)
+NEWTON_GTOL = 1e-12     # 수렴 판정 (|f'| 크기)
 
-# 4장 조건부 하이브리드 (Genie-aided)
-CH4_COARSE_N = 11       # 불확실 구간(D <= B/2)의 거친 그리드 점 수
-CH4_NEWTON_INIT = 0.3   # 안전 구간(D > B/2)의 뉴턴법 초기값
-CH4_MAX_ITER = 50       # 안전장치 뉴턴법 최대 반복 수 (이분법 대체 포함)
-CH4_TOL = 1e-9          # 안전장치 뉴턴법 수렴 판정 (phi 변화량)
-CH4_GTOL = 1e-12        # 안전장치 뉴턴법 수렴 판정 (|f'| 크기)
+# 거친 그리드 (4장 불확실 구간, 5장 예외 처리 공통)
+COARSE_N = 11           # 거친 그리드 점 수
 # ------------------------------------
 
 
@@ -89,8 +87,8 @@ def d2f_ch4(phi, A, B, D):
             - D**2 / (1 + D * phi)**2) / np.log(2.0)
 
 
-def _safeguarded_newton(lo, hi, p0, A, B, D, max_iter=CH4_MAX_ITER, tol=CH4_TOL):
-    # 전제: f'(lo) > 0 > f'(hi) 인 구간 [lo, hi] 안의 정지점 탐색
+def _safeguarded_newton(lo, hi, p0, dfun, d2fun, max_iter=NEWTON_MAX_ITER, tol=NEWTON_TOL):
+    # 전제: f'(lo) > 0 > f'(hi) 인 구간 [lo, hi] 안의 정지점 탐색 (dfun, d2fun: phi -> f', f'')
     # 뉴턴 스텝이 구간을 벗어나거나 f'' >= 0 이면 이분법 스텝으로 대체 -> 구간이 매 반복 줄어 수렴 보장
     lo, hi = lo.astype(float).copy(), hi.astype(float).copy()
     p = np.clip(p0, lo, hi).astype(float)
@@ -99,9 +97,9 @@ def _safeguarded_newton(lo, hi, p0, A, B, D, max_iter=CH4_MAX_ITER, tol=CH4_TOL)
     for _ in range(max_iter):
         if not active.any():
             break
-        g, h = df_ch4(p, A, B, D), d2f_ch4(p, A, B, D)
+        g, h = dfun(p), d2fun(p)
         n_eval += active                                  # 반복당 f', f'' 1회 평가
-        stationary = np.abs(g) < CH4_GTOL                 # 이미 정지점이면 그대로 종료
+        stationary = np.abs(g) < NEWTON_GTOL              # 이미 정지점이면 그대로 종료
         lo = np.where(active & (g > 0), p, lo)            # 정지점은 f'>0 쪽의 오른쪽
         hi = np.where(active & (g <= 0), p, hi)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -134,8 +132,10 @@ def optimize_genie_hybrid(A, B, D):
         p = np.where(at0, 0.0, PHI_MAX)
         if inner.any():
             k = np.where(inner)[0]
+            a, b, d = Ai[k], Bi[k], Di[k]
             pk, nk = _safeguarded_newton(np.zeros(len(k)), np.full(len(k), PHI_MAX),
-                                         np.full(len(k), CH4_NEWTON_INIT), Ai[k], Bi[k], Di[k])
+                                         np.full(len(k), NEWTON_INIT),
+                                         lambda p: df_ch4(p, a, b, d), lambda p: d2f_ch4(p, a, b, d))
             p[k] = pk; n_eval[i[k]] += nk
         phi[i] = p
 
@@ -143,18 +143,20 @@ def optimize_genie_hybrid(A, B, D):
     j = np.where(~safe)[0]
     if len(j):
         Aj, Bj, Dj = A[j], B[j], D[j]
-        coarse = np.linspace(0.0, PHI_MAX, CH4_COARSE_N)
+        coarse = np.linspace(0.0, PHI_MAX, COARSE_N)
         V = f_ch4(coarse[None, :], Aj[:, None], Bj[:, None], Dj[:, None])
         k = np.argmax(V, axis=1)
         p_grid, v_grid = coarse[k], V[np.arange(len(j)), k]
         lo = coarse[np.maximum(k - 1, 0)]
-        hi = coarse[np.minimum(k + 1, CH4_COARSE_N - 1)]
+        hi = coarse[np.minimum(k + 1, COARSE_N - 1)]
         bracket = (df_ch4(lo, Aj, Bj, Dj) > 0) & (df_ch4(hi, Aj, Bj, Dj) < 0)
-        n_eval[j] = CH4_COARSE_N + 2
+        n_eval[j] = COARSE_N + 2
         p = p_grid.copy()
         if bracket.any():
             b = np.where(bracket)[0]
-            pb, nb = _safeguarded_newton(lo[b], hi[b], p_grid[b], Aj[b], Bj[b], Dj[b])
+            a, bb, d = Aj[b], Bj[b], Dj[b]
+            pb, nb = _safeguarded_newton(lo[b], hi[b], p_grid[b],
+                                         lambda p: df_ch4(p, a, bb, d), lambda p: d2f_ch4(p, a, bb, d))
             better = f_ch4(pb, Aj[b], Bj[b], Dj[b]) >= v_grid[b]
             p[b] = np.where(better, pb, p_grid[b])
             n_eval[j[b]] += nb + 1
@@ -233,41 +235,98 @@ def ergodic_E_Ce(phi_grid, rho_e, derivs=False):
     return E_Ce, dE, d2E
 
 
-def optimize_proposed_hybrid(A, phi_grid, E_Ce, dE_Ce, d2E_Ce):
-    # 목적함수 [Cb(phi|h) - E_g[Ce](phi)]^+ 를 채널별로 최대화
+def an_off_threshold(rho_e):
+    # 인공 잡음 미사용 조건의 임계값 T(rho_e) = (1 + rho_e)(1 - e^{1/rho_e} E1(1/rho_e) / rho_e)
+    # C_bar'(0) <= 0  <=>  A / (1 + A) >= T(rho_e)  이면 phi* = 0
+    return (1.0 + rho_e) * (1.0 - _stable_exp_e1(np.array([1.0 / rho_e]))[0] / rho_e)
+
+
+def optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce):
+    # 5장 목적함수 C_bar(phi) = Cb(phi|h) - E_g[Ce](phi) 를 채널별로 최대화 (최종 전송률은 [.]^+)
     #   (조건부 에르고딕 보안 용량 E_g[[Cb-Ce]^+ | h]의 하한)
-    # 하이브리드 방식: 뉴턴법을 적용하되, 극단은 grid로 보호
-    # E_Ce 계열은 phi_grid 위 사전계산값 -> 뉴턴 중 격자 선형보간으로 연속 평가
+    # E_g[Ce]와 도함수는 SNR당 1회 phi_grid 위에서 계산해 모든 채널이 공유 -> 선형보간으로 연속 평가
+    # 절차 (5.4절: 비오목 구간은 phi*의 오른쪽에만 존재)
+    #   1) 경계 판정: 닫힌형 A/(1+A) >= T(rho_e) 이면 phi* = 0
+    #   2) 그 외: [0, PHI_MAX]에서 안전장치 뉴턴법으로 정지점 탐색
+    #   3) 예외(상한에서 기울기 >= 0, 또는 정지점에서 f'' >= 0): 거친 그리드 + 이웃 구간 뉴턴으로 대체
+    #      (저 SNR의 예외는 대부분 어떤 phi로도 보안 전송이 불가능한 채널)
+    # 반환: phi*, 채널별 평가 횟수, phi*=0 판정 여부, 예외 처리 여부
     ln2 = np.log(2.0); N = len(A)
+    phi = np.zeros(N); n_eval = np.ones(N)                 # 경계 판정 1회
+    off = A / (1.0 + A) >= an_off_threshold(rho_e)
+    fallback = np.zeros(N, dtype=bool)
 
-    # Grid: 안전장치 및 뉴턴법 초기값
-    one_minus = (1.0 - phi_grid)[None, :]
-    Cb_grid = np.log(1.0 + A[:, None] * one_minus) / ln2        # [N,G]
-    cs_grid = np.maximum(0.0, Cb_grid - E_Ce[None, :])          # [N,G]
-    idx_grid = np.argmax(cs_grid, axis=1)
-    phi_grid_star = phi_grid[idx_grid]                          # grid 해 [N]
+    def C(p, a):
+        return np.log2(1 + a * (1 - p)) - np.interp(p, phi_grid, E_Ce)
 
-    # 뉴턴법: grid 해에서 출발해 관심영역 내에서 정밀화, 벡터화 적용
-    phi = phi_grid_star.copy()
-    for _ in range(NEWTON_MAX_ITER):
-        within = (phi > 1e-4) & (phi < PHI_MAX_NEWTON)         # 관심영역만 갱신
-        d = 1.0 + A * (1.0 - phi)
-        Cbp = (-A / d) / ln2
-        Cbpp = (-A**2 / d**2) / ln2
-        csp = Cbp - np.interp(phi, phi_grid, dE_Ce)            # Cs_bar'
-        cspp = Cbpp - np.interp(phi, phi_grid, d2E_Ce)         # Cs_bar''
-        step = np.where(np.abs(cspp) > 1e-12, csp / cspp, 0.0)
-        phi_new = np.clip(phi - step, 1e-4, PHI_MAX_NEWTON)
-        phi = np.where(within, phi_new, phi)
-        if np.max(np.abs(np.where(within, step, 0.0))) < NEWTON_TOL:
-            break
+    def dC(p, a):
+        return (-a / (1 + a * (1 - p))) / ln2 - np.interp(p, phi_grid, dE_Ce)
 
-    # 뉴턴 해 평가 후 grid와 비교해 더 나은 쪽 채택
-    d = 1.0 + A * (1.0 - phi)
-    cs_newton = np.maximum(0.0, np.log(d) / ln2 - np.interp(phi, phi_grid, E_Ce))
-    cs_grid_best = cs_grid[np.arange(N), idx_grid]
-    phi_star = np.where(cs_newton >= cs_grid_best, phi, phi_grid_star)
-    return phi_star
+    def d2C(p, a):
+        return (-a**2 / (1 + a * (1 - p))**2) / ln2 - np.interp(p, phi_grid, d2E_Ce)
+
+    k = np.where(~off)[0]
+    if len(k):
+        a = A[k]
+        upper_ok = dC(np.full(len(k), PHI_MAX), a) < 0     # 상한에서 기울기 < 0 이어야 구간 [0, PHI_MAX] 성립
+        n_eval[k] += 1
+        pk = np.zeros(len(k)); fb = ~upper_ok
+        u = np.where(upper_ok)[0]
+        if len(u):
+            au = a[u]
+            pu, nu = _safeguarded_newton(np.zeros(len(u)), np.full(len(u), PHI_MAX), np.full(len(u), NEWTON_INIT),
+                                         lambda p: dC(p, au), lambda p: d2C(p, au))
+            n_eval[k[u]] += nu
+            pk[u] = pu
+            fb[u] = d2C(pu, au) >= 0                        # 극대가 아니면 예외 처리
+        if fb.any():                                        # 예외: 거친 그리드 + 이웃 구간 뉴턴 (4장 불확실 구간과 동일)
+            f_idx = np.where(fb)[0]; af = a[f_idx]
+            coarse = np.linspace(0.0, PHI_MAX, COARSE_N)
+            V = C(coarse[None, :], af[:, None])
+            j = np.argmax(V, axis=1)
+            p_c, v_c = coarse[j], V[np.arange(len(f_idx)), j]
+            lo = coarse[np.maximum(j - 1, 0)]
+            hi = coarse[np.minimum(j + 1, COARSE_N - 1)]
+            br = (dC(lo, af) > 0) & (dC(hi, af) < 0)
+            n_eval[k[f_idx]] += COARSE_N + 2
+            if br.any():
+                b = np.where(br)[0]; ab = af[b]
+                pb, nb = _safeguarded_newton(lo[b], hi[b], p_c[b], lambda p: dC(p, ab), lambda p: d2C(p, ab))
+                p_c[b] = np.where(C(pb, ab) >= v_c[b], pb, p_c[b])
+                n_eval[k[f_idx[b]]] += nb + 1
+            pk[f_idx] = p_c
+        phi[k] = pk; fallback[k] = fb
+    # 보안 전송이 불가능한 채널(max C_bar <= 0)은 인공 잡음을 쓸 이유가 없으므로 phi = 0
+    no_secrecy = C(phi, A) <= 0
+    n_eval += 1
+    phi = np.where(no_secrecy, 0.0, phi)
+    return phi, n_eval, off, fallback
+
+
+def verify_ch5_hybrid(snr_db_list=(-10, 0, 10, 20, 30), num_samples=20000, ref_points=20001, seed=2):
+    # 5장 하이브리드 검증: E_g[Ce]를 초정밀 그리드(ref_points)에서 직접 계산한 참값 기준 목적함수 손실, 평가 횟수
+    rng = np.random.default_rng(seed)
+    ref = np.linspace(0.0, PHI_MAX, ref_points)
+    g201 = np.linspace(0.0, PHI_MAX, NUM_PHI)
+    print(f"[5장 하이브리드 검증] 표본 {num_samples}, 기준 그리드 {ref_points}점")
+    print(f"{'SNR(dB)':>7} | {'phi*=0':>7} | {'예외':>7} | {'손실 평균':>10} | {'손실 최대':>10} | "
+          f"{'201점 최대손실':>13} | {'평가횟수 평균':>12} | {'최대':>4}")
+    for snr_db in snr_db_list:
+        rho = 10 ** (snr_db / 10)
+        A, _, _ = generate_gains(rng, num_samples, rho, rho)
+        E, dE, d2E = ergodic_E_Ce(g201, rho, derivs=True)
+        E_ref = ergodic_E_Ce(ref, rho)
+        phi, n_eval, off, fb = optimize_proposed_hybrid(A, rho, g201, E, dE, d2E)
+        v_h = np.maximum(0, np.log2(1 + A * (1 - phi)) - np.interp(phi, ref, E_ref))   # 참값 기준 평가
+        v_ref = np.empty(num_samples); v_201 = np.empty(num_samples)
+        E201 = np.interp(g201, ref, E_ref)
+        for s0 in range(0, num_samples, 1000):                     # 메모리 절약용 청크
+            sl = slice(s0, s0 + 1000)
+            v_ref[sl] = np.maximum(0, np.log2(1 + A[sl, None] * (1 - ref)[None, :]) - E_ref[None, :]).max(1)
+            v_201[sl] = np.maximum(0, np.log2(1 + A[sl, None] * (1 - g201)[None, :]) - E201[None, :]).max(1)
+        loss = v_ref - v_h
+        print(f"{snr_db:>7} | {off.mean():>7.3f} | {fb.mean():>7.4f} | {loss.mean():>10.1e} | {loss.max():>10.1e} | "
+              f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4}")
 
 
 def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=SIGMA_E2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
@@ -275,7 +334,7 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
     # ----- 결과 누적용 dictionary -----
-    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac"]}
+    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac"]}
 
     # ----- 진행 상황 출력 -----
     print(f"시뮬레이션 시작 (Samples: {num_samples}, Rs: {Rs} bps/Hz)")
@@ -303,9 +362,9 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         # h는 알고(순시), g만 분포로 처리 -> 목적함수: [Cb(phi|h) - E_g[Ce](phi)]^+
         #   Cb(phi|h) = log2(1 + A(1-phi))   : h로 직접 (g 무관)
         #   E_g[Ce](phi)                     : g 분포로 평균 (h 무관 -> SNR당 1회)
-        # 오목성 분석에 근거한 하이브리드(기본 뉴턴 + 극단 grid)로 최적화.
+        # 경계 판정(닫힌형) + 안전장치 뉴턴법, 예외 시 그리드로 최적화 (5.4, 5.5절)
         E_Ce, dE_Ce, d2E_Ce = ergodic_E_Ce(phi_grid, rho_e, derivs=True)  # [G]×3, h 무관하여 공유
-        phi_proposed = optimize_proposed_hybrid(A, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
+        phi_proposed, n_eval_prop, an_off, _ = optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce)  # [N]
         # 실현 성능: blind 선택한 phi를 실제 g 위에서 평가 (phi는 격자 밖일 수 있어 직접 계산)
         sinr_e_prop = (B * (1 - phi_proposed)) / (1 + D * phi_proposed)
         cs_proposed = np.maximum(0.0, np.log2(1 + A * (1 - phi_proposed)) - np.log2(1 + sinr_e_prop))
@@ -322,6 +381,8 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         res["phi_proposed"].append(phi_proposed.mean())
         res["evals_genie"].append(n_eval_genie.mean())   # Genie 결정당 평균 평가 횟수
         res["safe_frac"].append(safe.mean())             # 안전 구간(D > B/2) 비율
+        res["evals_proposed"].append(n_eval_prop.mean()) # Proposed 결정당 평균 평가 횟수
+        res["an_off_frac"].append(an_off.mean())         # 인공 잡음 미사용(phi*=0) 판정 비율
 
         # ----- 현재 SNR 행 콘솔 출력 -----
         print(
@@ -394,5 +455,6 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
 
 if __name__ == "__main__":
     verify_ch4_hybrid()
+    verify_ch5_hybrid()
     results = run_simulation()
     plot_results(results)
