@@ -360,6 +360,70 @@ def sop_closed_form(A, phi, rho_e, Rs=RS):
     return np.where(theta > 0, p, 1.0)
 
 
+def verify_analysis(snr_db_list=(-10, 0, 10, 20, 30), phi_list=(0.0, 0.25, 0.5, 0.75, 0.95),
+                    num_samples=200000, seed=3):
+    # 해석식 검증: 같은 양을 식과 Monte Carlo로 각각 구해 비교
+    #   A. 5.3절 E_g[Ce](phi) 준닫힌형 vs MC (미리 정한 phi, 탐색 구간 전체)
+    #   B. 5.6절 조건부 SOP 닫힌형 vs MC (미리 정한 phi, ||h||^2)
+    #   C. 고른 phi*에서 Proposed의 예측 성능(반해석) vs 실제 성능(MC)
+    # MC는 X, Y를 직접 뽑지 않고 실제 채널과 beamforming으로 만든 B, D를 사용 -> 5.2절 분포 유도까지 함께 검증
+    # z: |식 - MC| / MC 표준오차 (대략 3 이하면 통계적 잡음 범위)
+    rng = np.random.default_rng(seed)
+    phi_arr = np.array(phi_list, dtype=float)
+    g201 = np.linspace(0.0, PHI_MAX, NUM_PHI)
+
+    print(f"[해석식 검증 A] 5.3절 E_g[Ce](phi): 준닫힌형 vs MC (표본 {num_samples})")
+    print(f"{'SNR(dB)':>7} | {'phi':>5} | {'식':>9} | {'MC':>9} | {'상대오차':>9} | {'z':>5}")
+    worst_a = 0.0
+    for snr_db in snr_db_list:
+        rho = 10 ** (snr_db / 10)
+        _, B, D = generate_gains(rng, num_samples, rho, rho)
+        E_formula = ergodic_E_Ce(phi_arr, rho)
+        for phi, ef in zip(phi_arr, E_formula):
+            ce = np.log2(1 + B * (1 - phi) / (1 + D * phi))
+            mc, se = ce.mean(), ce.std() / np.sqrt(num_samples)
+            z = abs(ef - mc) / se if se > 0 else 0.0
+            worst_a = max(worst_a, z)
+            rel = abs(ef - mc) / mc if mc > 0 else 0.0
+            print(f"{snr_db:>7} | {phi:>5.2f} | {ef:>9.5f} | {mc:>9.5f} | {rel:>9.2e} | {z:>5.2f}")
+    print(f"  -> 최대 z = {worst_a:.2f}")
+
+    print(f"\n[해석식 검증 B] 5.6절 조건부 SOP: 닫힌형 vs MC (Rs = {RS})")
+    print(f"{'SNR(dB)':>7} | {'phi':>5} | {'||h||^2':>7} | {'식':>9} | {'MC':>9} | {'z':>5}")
+    worst_b = 0.0
+    for snr_db in (10, 20, 30):                                          # 0 dB 이하는 대부분 theta <= 0이라 둘 다 1
+        rho = 10 ** (snr_db / 10)
+        _, B, D = generate_gains(rng, num_samples, rho, rho)
+        for phi in (0.0, 0.5, 0.9):
+            for x in (0.5, 2.0):
+                A = rho * x                                                  # ||h||^2 = x로 고정
+                p_formula = sop_closed_form(np.array([A]), phi, rho)[0]
+                d = np.log2(1 + A * (1 - phi)) - np.log2(1 + B * (1 - phi) / (1 + D * phi))
+                mc = np.mean(d < RS)
+                se = np.sqrt(max(mc * (1 - mc), 1e-12) / num_samples)
+                z = abs(p_formula - mc) / se
+                worst_b = max(worst_b, z)
+                print(f"{snr_db:>7} | {phi:>5.2f} | {x:>7.1f} | {p_formula:>9.5f} | {mc:>9.5f} | {z:>5.2f}")
+    print(f"  -> 최대 z = {worst_b:.2f}")
+
+    print(f"\n[해석식 검증 C] 고른 phi*에서 Proposed의 예측(반해석) vs 실제(MC)")
+    print(f"{'SNR(dB)':>7} | {'전송률 예측':>10} | {'전송률 MC':>9} | {'z':>5} | {'SOP 예측':>9} | {'SOP MC':>9} | {'z':>5}")
+    for snr_db in snr_db_list:
+        rho = 10 ** (snr_db / 10)
+        A, B, D = generate_gains(rng, num_samples, rho, rho)
+        E, dE, d2E = ergodic_E_Ce(g201, rho, derivs=True)
+        phi, _, _, _ = optimize_proposed_hybrid(A, rho, g201, E, dE, d2E)
+        c_bar = np.log2(1 + A * (1 - phi)) - np.interp(phi, g201, E)          # 목적함수 값 (h만으로 계산)
+        d = f_ch4(phi, A, B, D)                                              # 실제 g 위의 Cb - Ce
+        r_mc_blocks = np.where(c_bar > 0, d, 0.0)
+        r_pred, r_mc = np.maximum(0.0, c_bar).mean(), r_mc_blocks.mean()
+        z_r = abs(r_pred - r_mc) / (r_mc_blocks.std() / np.sqrt(num_samples))
+        s_pred, s_mc = sop_closed_form(A, phi, rho).mean(), np.mean(d < RS)
+        se_s = np.sqrt(max(s_mc * (1 - s_mc), 1e-12) / num_samples)
+        z_s = abs(s_pred - s_mc) / se_s
+        print(f"{snr_db:>7} | {r_pred:>10.5f} | {r_mc:>9.5f} | {z_r:>5.2f} | {s_pred:>9.5f} | {s_mc:>9.5f} | {z_s:>5.2f}")
+
+
 def optimize_static_phi(rho_b, phi_grid, E_Ce, n=STATIC_TRAIN_N, seed=STATIC_SEED, chunk=20000):
     # SNR-static: h 순시값 없이 채널 통계만으로 SNR당 하나의 phi 결정
     #   phi_static = argmax_phi E_h[ [Cb(phi) - E_g[Ce](phi)]^+ ]  (달성 가능 전송률의 기댓값)
@@ -523,6 +587,7 @@ if __name__ == "__main__":
     # 검증
     verify_ch4_hybrid()
     verify_ch5_hybrid()
+    verify_analysis()
 
     # 시뮬레이션 수행
     plot_results(run_simulation())
