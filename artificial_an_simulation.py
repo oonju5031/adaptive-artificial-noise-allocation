@@ -11,6 +11,7 @@ from scipy.special import exp1
 #   - Fixed(전력비 고정 기법)
 #   - Genie-aided(Eve의 CSI를 아는 경우, 성능 상한선)
 #   - Proposed(Eve의 CSI를 모르는 경우)
+#   - SNR-static(SNR마다 채널 통계로 정한 고정 phi, h 순시값에 따른 적응 없음)
 # - 평가 지표
 #   - 에르고딕 보안 용량: Genie는 E[[Cb-Ce]^+] (Eve CSI로 블록별 판정 가능)
 #     Fixed, Proposed는 달성 가능 전송률 E[1{전송}(Cb-Ce)] (h만으로 전송 여부 결정, 누설 블록 포함)
@@ -30,6 +31,8 @@ SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
 NT = 2              # 송신 안테나 수 (현 공식은 2로 고정된 경우에 한정됨, TODO: 이후 N_t > 2인 경우로 확장 예정)
 
 FIXED_PHI = 0.5     # 전력비 고정 기법의 전력비
+STATIC_TRAIN_N = 200000   # SNR-static의 phi 계산용 독립 표본 수 (시뮬레이션 표본과 별도)
+STATIC_SEED = 12345       # SNR-static 표본 시드 (시뮬레이션 시드와 분리)
 PHI_MAX = 0.99      # phi 탐색 상한 (1.0인 경우 신호 전력이 0이므로 제외)
 
 EG_QUAD_N = 400     # E_g[Ce]의 Y(AN 성분) 수치적분 격자점 수
@@ -333,12 +336,24 @@ def verify_ch5_hybrid(snr_db_list=(-10, 0, 10, 20, 30), num_samples=20000, ref_p
               f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4}")
 
 
+def optimize_static_phi(rho_b, phi_grid, E_Ce, n=STATIC_TRAIN_N, seed=STATIC_SEED, chunk=20000):
+    # SNR-static: h 순시값 없이 채널 통계만으로 SNR당 하나의 phi 결정
+    #   phi_static = argmax_phi E_h[ [Cb(phi) - E_g[Ce](phi)]^+ ]  (달성 가능 전송률의 기댓값)
+    # ||h||^2 ~ Gamma(Nt, 1) (h ~ CN(0, I), Nt=2) 독립 표본으로 E_h를 추정 -> 평가 표본과 분리해 편향 방지
+    rng = np.random.default_rng(seed)
+    acc = np.zeros(len(phi_grid))
+    for s0 in range(0, n, chunk):
+        A = rho_b * rng.gamma(NT, 1.0, size=min(chunk, n - s0))
+        acc += np.maximum(0.0, np.log2(1 + A[:, None] * (1 - phi_grid)[None, :]) - E_Ce[None, :]).sum(axis=0)
+    return phi_grid[np.argmax(acc)]
+
+
 def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=SIGMA_E2, snr_db_range=SNR_DB_RANGE, num_phi=NUM_PHI, seed=SEED):
     rng = np.random.default_rng(seed)               # 시드 고정 난수 생성기
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
     # ----- 결과 누적용 dictionary -----
-    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac", "cs_proposed_ideal", "cs_proposed_obj"]}
+    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac", "cs_proposed_ideal", "cs_proposed_obj", "cs_static", "sop_static", "phi_static"]}
 
     # ----- 진행 상황 출력 -----
     print(f"시뮬레이션 시작 (Samples: {num_samples}, Rs: {Rs} bps/Hz)")
@@ -363,6 +378,12 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         tx_fixed = np.log2(1 + A * (1 - FIXED_PHI)) - np.interp(FIXED_PHI, phi_grid, E_Ce) > 0  # h만으로 전송 여부
         cs_fixed = np.where(tx_fixed, d_fixed, 0.0)                           # 달성 가능 (음수 블록 포함)
 
+        # ===== 1-2. SNR-static: SNR마다 채널 통계로 정한 고정 phi (Eve CSI 없음, h 적응 없음) =====
+        phi_static = optimize_static_phi(rho_b, phi_grid, E_Ce)
+        d_static = f_ch4(phi_static, A, B, D)
+        tx_static = np.log2(1 + A * (1 - phi_static)) - np.interp(phi_static, phi_grid, E_Ce) > 0
+        cs_static = np.where(tx_static, d_static, 0.0)                        # 달성 가능 (Fixed와 같은 규칙)
+
         # ===== 2. Genie-aided: Eve의 CSI를 알고 4장 조건부 하이브리드로 phi 선택 =====
         phi_genie, n_eval_genie, safe = optimize_genie_hybrid(A, B, D)
         d_genie = f_ch4(phi_genie, A, B, D)
@@ -380,14 +401,17 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         res["snr"].append(snr_db)
         res["cs_fixed"].append(cs_fixed.mean())          # 에르고딕 보안 용량 (Fixed, Proposed: 달성 가능 전송률)
         res["cs_genie"].append(cs_genie.mean())
+        res["cs_static"].append(cs_static.mean())
         res["cs_proposed"].append(cs_proposed.mean())
         res["cs_proposed_ideal"].append(np.maximum(0.0, d_prop).mean())  # 참고: Eve CSI가 있어야 가능한 블록별 판정
         res["cs_proposed_obj"].append(np.maximum(0.0, c_bar_prop).mean())  # 참고: 목적함수 값 평균 (달성 가능값의 해석 추정)
         res["sop_fixed"].append(np.mean(d_fixed < Rs))   # SOP = P(Cb - Ce < Rs)
         res["sop_genie"].append(np.mean(d_genie < Rs))
+        res["sop_static"].append(np.mean(d_static < Rs))
         res["sop_proposed"].append(np.mean(d_prop < Rs))
         res["phi_genie"].append(phi_genie.mean())        # 평균 선택 phi
         res["phi_proposed"].append(phi_proposed.mean())
+        res["phi_static"].append(phi_static)
         res["evals_genie"].append(n_eval_genie.mean())   # Genie 결정당 평균 평가 횟수
         res["safe_frac"].append(safe.mean())             # 안전 구간(D > B/2) 비율
         res["evals_proposed"].append(n_eval_prop.mean()) # Proposed 결정당 평균 평가 횟수
@@ -408,7 +432,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     floor = max(1.0 / num_samples, 1e-6)  # semilogy에서 0 방지용 바닥값
 
     # 색상·스타일 상수 (기법별 통일)
-    C_FIX, C_GEN, C_PRO = "#f59e0b", "#10b981", "#3b82f6"
+    C_FIX, C_GEN, C_PRO, C_STA = "#f59e0b", "#10b981", "#3b82f6", "#8b5cf6"
 
     plt.figure(figsize=(13, 10))
 
@@ -416,6 +440,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.subplot(2, 2, 1)
     plt.plot(snr, res["cs_fixed"], "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
     plt.plot(snr, res["cs_genie"], "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
+    plt.plot(snr, res["cs_static"], "x:", color=C_STA, label="SNR-static", linewidth=1.6, markersize=7, zorder=2)
     plt.plot(snr, res["cs_proposed"], "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=2)
     plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("Ergodic Secrecy Rate (bps/Hz)")
@@ -427,6 +452,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.subplot(2, 2, 2)
     plt.axhline(FIXED_PHI, color=C_FIX, linestyle="-", linewidth=1.6, label="Fixed (phi=0.5)", zorder=1)
     plt.plot(snr, res["phi_genie"], "v--", color=C_GEN, label="Genie-aided", linewidth=1.5, zorder=2)
+    plt.plot(snr, res["phi_static"], "x:", color=C_STA, label="SNR-static", linewidth=1.6, markersize=7, zorder=2)
     plt.plot(snr, res["phi_proposed"], "D-", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2, zorder=3)
     plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("Average Optimal Power Ratio (phi*)")
@@ -438,11 +464,13 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     # ===== (3) 상한선 대비 보안 용량 격차 =====
     gap_proposed = np.array(res["cs_genie"]) - np.array(res["cs_proposed"])
     gap_fixed = np.array(res["cs_genie"]) - np.array(res["cs_fixed"])
+    gap_static = np.array(res["cs_genie"]) - np.array(res["cs_static"])
     plt.subplot(2, 2, 3)
     plt.plot(snr, gap_fixed, "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, markersize=6, markerfacecolor="white", markeredgewidth=1.5)
+    plt.plot(snr, gap_static, "x:", color=C_STA, label="SNR-static", linewidth=1.6, markersize=7)
     plt.plot(snr, gap_proposed, "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=2)
     plt.xlabel("Transmit SNR (dB)")
-    plt.ylabel("Capacity Gap from Genie (bps/Hz)")
+    plt.ylabel("Rate Gap from Genie (bps/Hz)")
     plt.title("Gap to Upper Bound (lower = closer)")
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.legend()
@@ -451,6 +479,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.subplot(2, 2, 4)
     plt.semilogy(snr, np.maximum(res["sop_fixed"], floor), "o-", color=C_FIX, label="Fixed (phi=0.5)", linewidth=1.8, zorder=2)
     plt.semilogy(snr, np.maximum(res["sop_genie"], floor), "^-", color=C_GEN, label="Genie-aided (Full Eve CSI)", linewidth=4.5, markersize=11, alpha=0.9, zorder=1)
+    plt.semilogy(snr, np.maximum(res["sop_static"], floor), "x:", color=C_STA, label="SNR-static", linewidth=1.6, markersize=7, zorder=2)
     plt.semilogy(snr, np.maximum(res["sop_proposed"], floor), "s--", color=C_PRO, label="Proposed (No Eve CSI)", linewidth=1.6, markersize=6, markerfacecolor="white", markeredgewidth=1.5, zorder=3)
     plt.xlabel("Transmit SNR (dB)")
     plt.ylabel("SOP (Log Scale)")
