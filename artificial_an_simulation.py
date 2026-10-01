@@ -348,6 +348,18 @@ def verify_ch5_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_po
               f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4}")
 
 
+def sop_closed_form(A, phi, rho_e, Rs=RS):
+    # 5.6절 조건부 SOP 닫힌형: P(Cb - Ce < Rs | h), 블록별 [N]
+    #   theta = (1 + A(1-phi)) / 2^Rs - 1
+    #   theta > 0 : (1-phi) / (theta*phi + 1 - phi) * exp(-theta / (rho_e (1-phi)))
+    #   theta <= 0: 1 (Bob의 용량만으로도 Rs에 못 미침)
+    phi = np.broadcast_to(np.asarray(phi, dtype=float), np.shape(A))
+    theta = (1 + A * (1 - phi)) / 2 ** Rs - 1
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        p = (1 - phi) / (theta * phi + 1 - phi) * np.exp(-theta / (rho_e * (1 - phi)))
+    return np.where(theta > 0, p, 1.0)
+
+
 def optimize_static_phi(rho_b, phi_grid, E_Ce, n=STATIC_TRAIN_N, seed=STATIC_SEED, chunk=20000):
     # SNR-static: h 순시값 없이 채널 통계만으로 SNR당 하나의 phi 결정
     #   phi_static = argmax_phi E_h[ [Cb(phi) - E_g[Ce](phi)]^+ ]  (달성 가능 전송률의 기댓값)
@@ -365,7 +377,7 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
     phi_grid = np.linspace(0.0, PHI_MAX, num_phi)   # phi 후보값 배열 [G]
 
     # ----- 결과 누적용 dictionary -----
-    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac", "cs_proposed_ideal", "cs_proposed_obj", "cs_static", "sop_static", "phi_static"]}
+    res = {k: [] for k in ["snr", "cs_fixed", "cs_genie", "cs_proposed", "sop_fixed", "sop_genie", "sop_proposed", "phi_genie", "phi_proposed", "evals_genie", "safe_frac", "evals_proposed", "an_off_frac", "cs_proposed_ideal", "cs_proposed_obj", "cs_static", "sop_static", "phi_static", "sop_fixed_ana", "sop_static_ana", "sop_proposed_ana"]}
 
     # ----- 진행 상황 출력 -----
     print(f"시뮬레이션 시작 (Samples: {num_samples}, Rs: {Rs} bps/Hz)")
@@ -421,6 +433,10 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
         res["sop_genie"].append(np.mean(d_genie < Rs))
         res["sop_static"].append(np.mean(d_static < Rs))
         res["sop_proposed"].append(np.mean(d_prop < Rs))
+        # 참고: 선택한 phi로 5.6절 닫힌형을 블록별 계산 후 h에 대해 평균한 반해석 SOP (Genie는 g를 알아 닫힌형 없음)
+        res["sop_fixed_ana"].append(sop_closed_form(A, FIXED_PHI, rho_e, Rs).mean())
+        res["sop_static_ana"].append(sop_closed_form(A, phi_static, rho_e, Rs).mean())
+        res["sop_proposed_ana"].append(sop_closed_form(A, phi_proposed, rho_e, Rs).mean())
         res["phi_genie"].append(phi_genie.mean())        # 평균 선택 phi
         res["phi_proposed"].append(phi_proposed.mean())
         res["phi_static"].append(phi_static)
