@@ -27,6 +27,7 @@ SIGMA_E2 = 1.0                          # Eve 잡음 분산
 NUM_PHI = 201                           # Grid search 해상도(정밀도)
 SEED = 0                                # 난수 시드 (재현성)
 SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
+RUN_VERIFY = False                      # True면 시뮬레이션 전에 검증 함수 실행 (터미널에 검증 수치 출력)
 
 NT = 2              # 송신 안테나 수 (현 공식은 2로 고정된 경우에 한정됨, TODO: 이후 N_t > 2인 경우로 확장 예정)
 
@@ -579,9 +580,10 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
 
 if __name__ == "__main__":
     # 검증
-    verify_ch4_hybrid()
-    verify_ch5_hybrid()
-    verify_analysis()
+    if RUN_VERIFY:
+        verify_ch4_hybrid()
+        verify_ch5_hybrid()
+        verify_analysis()
 
     # 시뮬레이션 수행
     plot_results(run_simulation())
