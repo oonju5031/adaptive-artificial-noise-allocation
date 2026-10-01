@@ -119,6 +119,22 @@ def _safeguarded_newton(lo, hi, p0, dfun, d2fun, max_iter=NEWTON_MAX_ITER, tol=N
     return p, n_eval
 
 
+def _neighbor_bracket(coarse, k, dfun):
+    # 거친 그리드 최선점 coarse[k]의 기울기 부호로 최대점이 있는 이웃 구간 하나를 고름
+    #   f'(p_k) > 0 -> [p_k, p_{k+1}],  f'(p_k) <= 0 -> [p_{k-1}, p_k]
+    # 반환: lo, hi, 유효 여부(f'(lo) > 0 > f'(hi)), 평가 횟수(2: 최선점과 이웃점의 기울기)
+    last = len(coarse) - 1
+    p_k = coarse[k]
+    g_k = dfun(p_k)
+    right = g_k > 0
+    nb = np.where(right, coarse[np.minimum(k + 1, last)], coarse[np.maximum(k - 1, 0)])
+    g_nb = dfun(nb)
+    lo = np.where(right, p_k, nb)
+    hi = np.where(right, nb, p_k)
+    valid = (hi > lo) & np.where(right, g_nb < 0, g_nb > 0)
+    return lo, hi, valid, 2
+
+
 def optimize_genie_hybrid(A, B, D):
     # 4장 조건부 하이브리드: Eve의 순시 CSI(B, D)를 아는 경우 f(phi)를 채널별로 최대화
     #   안전 구간 (D > B/2): f가 [0,1]에서 오목 -> 경계 판정 후 뉴턴법만 사용
@@ -154,10 +170,8 @@ def optimize_genie_hybrid(A, B, D):
         V = f_ch4(coarse[None, :], Aj[:, None], Bj[:, None], Dj[:, None])
         k = np.argmax(V, axis=1)
         p_grid, v_grid = coarse[k], V[np.arange(len(j)), k]
-        lo = coarse[np.maximum(k - 1, 0)]
-        hi = coarse[np.minimum(k + 1, COARSE_N - 1)]
-        bracket = (df_ch4(lo, Aj, Bj, Dj) > 0) & (df_ch4(hi, Aj, Bj, Dj) < 0)
-        n_eval[j] = COARSE_N + 2
+        lo, hi, bracket, n_br = _neighbor_bracket(coarse, k, lambda p: df_ch4(p, Aj, Bj, Dj))
+        n_eval[j] = COARSE_N + n_br
         p = p_grid.copy()
         if bracket.any():
             b = np.where(bracket)[0]
@@ -190,7 +204,7 @@ def generate_gains(rng, n, rho_b, rho_e):
     return A, B, D
 
 
-def verify_ch4_hybrid(snr_db_list=(0, 10, 20, 30), num_samples=20000, ref_points=20001, seed=1):
+def verify_ch4_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_points=20001, seed=1):
     # 4장 하이브리드 검증: 초정밀 그리드(ref_points) 대비 손실, 201점 그리드와의 비교, 평가 횟수
     rng = np.random.default_rng(seed)
     ref = np.linspace(0.0, PHI_MAX, ref_points)
@@ -292,10 +306,8 @@ def optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce):
             V = C(coarse[None, :], af[:, None])
             j = np.argmax(V, axis=1)
             p_c, v_c = coarse[j], V[np.arange(len(f_idx)), j]
-            lo = coarse[np.maximum(j - 1, 0)]
-            hi = coarse[np.minimum(j + 1, COARSE_N - 1)]
-            br = (dC(lo, af) > 0) & (dC(hi, af) < 0)
-            n_eval[k[f_idx]] += COARSE_N + 2
+            lo, hi, br, n_br = _neighbor_bracket(coarse, j, lambda p: dC(p, af))
+            n_eval[k[f_idx]] += COARSE_N + n_br
             if br.any():
                 b = np.where(br)[0]; ab = af[b]
                 pb, nb = _safeguarded_newton(lo[b], hi[b], p_c[b], lambda p: dC(p, ab), lambda p: d2C(p, ab))
@@ -310,7 +322,7 @@ def optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce):
     return phi, n_eval, off, fallback
 
 
-def verify_ch5_hybrid(snr_db_list=(-10, 0, 10, 20, 30), num_samples=20000, ref_points=20001, seed=2):
+def verify_ch5_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_points=20001, seed=2):
     # 5장 하이브리드 검증: E_g[Ce]를 초정밀 그리드(ref_points)에서 직접 계산한 참값 기준 목적함수 손실, 평가 횟수
     rng = np.random.default_rng(seed)
     ref = np.linspace(0.0, PHI_MAX, ref_points)
@@ -492,7 +504,9 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
 
 
 if __name__ == "__main__":
+    # 검증
     verify_ch4_hybrid()
     verify_ch5_hybrid()
-    results = run_simulation()
-    plot_results(results)
+
+    # 시뮬레이션 수행
+    plot_results(run_simulation())
