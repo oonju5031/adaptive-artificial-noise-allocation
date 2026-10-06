@@ -27,7 +27,7 @@ SIGMA_E2 = 1.0                          # Eve 잡음 분산
 NUM_PHI = 201                           # Grid search 해상도(정밀도)
 SEED = 0                                # 난수 시드 (재현성)
 SNR_DB_RANGE = np.arange(-20, 31, 5)    # 송신 SNR 구간 (dB)
-RUN_VERIFY = False                      # True면 시뮬레이션 전에 검증 함수 실행 (터미널에 검증 수치 출력)
+RUN_VERIFY = False                      # True면 시뮬레이션 전에 검증 함수 실행 (논문용 검증 수치 출력)
 
 NT = 2              # 송신 안테나 수 (현 공식은 2로 고정된 경우에 한정됨, TODO: 이후 N_t > 2인 경우로 확장 예정)
 
@@ -39,7 +39,7 @@ PHI_MAX = 0.99      # phi 탐색 상한 (1.0인 경우 신호 전력이 0이므�
 EG_QUAD_N = 400     # E_g[Ce]의 Y(AN 성분) 수치적분 격자점 수
 EG_QUAD_YMAX = 60.0 # Y 적분 상한 (Exp(1) tail, e^{-60}은 무시 가능)
 
-# 뉴턴법 (4장, 5장 공통, 구간을 벗어나면 이분법으로 보완)
+# 뉴턴법 (4장, 5장 공통, 구간 이탈 또는 수렴 지연 시 이분법으로 보완)
 NEWTON_INIT = 0.3       # 뉴턴법 초기값
 NEWTON_MAX_ITER = 50    # 최대 반복 수 (이분법 대체 포함)
 NEWTON_TOL = 1e-9       # 수렴 판정 (phi 변화량)
@@ -97,11 +97,17 @@ def d2f_ch4(phi, A, B, D):
 
 def _newton_in_interval(lo, hi, p0, dfun, d2fun, max_iter=NEWTON_MAX_ITER, tol=NEWTON_TOL):
     # 구간 [lo, hi] 안에서 뉴턴법으로 극대점 탐색 (전제: f'(lo) > 0 > f'(hi), dfun, d2fun: phi -> f', f'')
-    # 뉴턴 스텝이 구간을 벗어나거나 f'' >= 0이면 구간 중앙으로 이동(이분법) -> 구간이 매 반복 줄어 수렴 보장
+    # f'(phi) = 0의 근을 뉴턴법과 이분법을 결합해 탐색 (Numerical Recipes의 rtsafe와 같은 구조)
+    # 다음 경우 뉴턴법의 갱신값 대신 구간의 중점으로 이동(이분법)
+    #   1) 갱신값이 구간을 벗어나거나 f'' >= 0
+    #   2) 뉴턴 갱신 폭이 두 반복 전 갱신 폭의 절반보다 큼 (구간이 충분히 빨리 줄지 않음)
+    # -> 두 반복마다 갱신 폭이 절반 이하로 줄어 수렴 보장, 해 근처에서는 뉴턴법의 이차 수렴
     lo, hi = lo.astype(float).copy(), hi.astype(float).copy()
     p = np.clip(p0, lo, hi).astype(float)
     n_eval = np.zeros(len(p))
     active = np.ones(len(p), dtype=bool)
+    dx_last = hi - lo                                     # 직전 갱신 폭
+    dx_before = hi - lo                                   # 두 반복 전 갱신 폭
     for _ in range(max_iter):
         if not active.any():
             break
@@ -111,10 +117,14 @@ def _newton_in_interval(lo, hi, p0, dfun, d2fun, max_iter=NEWTON_MAX_ITER, tol=N
         lo = np.where(active & (g > 0), p, lo)            # 정지점은 f'>0 쪽의 오른쪽
         hi = np.where(active & (g <= 0), p, hi)
         with np.errstate(divide="ignore", invalid="ignore"):
-            p_new = np.where(h < 0, p - g / h, np.nan)
-        bad = ~((p_new >= lo) & (p_new <= hi))            # 경계 포함 판정 (NaN은 bad)
-        p_new = np.where(bad, 0.5 * (lo + hi), p_new)
-        done = stationary | (np.abs(p_new - p) < tol)
+            p_newton = np.where(h < 0, p - g / h, np.nan)
+        out = ~((p_newton >= lo) & (p_newton <= hi))       # 구간 이탈 또는 f'' >= 0 (NaN)
+        slow = np.abs(p_newton - p) > 0.5 * dx_before      # 갱신 폭이 충분히 줄지 않음
+        p_new = np.where(out | slow, 0.5 * (lo + hi), p_newton)
+        step = np.abs(p_new - p)
+        dx_before = np.where(active, dx_last, dx_before)
+        dx_last = np.where(active, step, dx_last)
+        done = stationary | (step < tol)
         p = np.where(active & ~stationary, p_new, p)
         active &= ~done
     return p, n_eval
