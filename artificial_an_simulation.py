@@ -217,26 +217,35 @@ def generate_gains(rng, n, rho_b, rho_e):
 
 def verify_ch4_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_points=20001, seed=1):
     # 4장 하이브리드 검증: 초정밀 그리드(ref_points) 대비 손실, 201점 그리드와의 비교, 평가 횟수
+    # + 상한 절단 영향: 탐색 구간을 [0, PHI_MAX]로 제한해 [0, 1)의 최적해를 놓치는 채널 비율과 손실
     rng = np.random.default_rng(seed)
     ref = np.linspace(0.0, PHI_MAX, ref_points)
+    ext = np.linspace(PHI_MAX, 1.0, int(round((1.0 - PHI_MAX) / (ref[1] - ref[0]))) + 1)[1:]
+    ref_full = np.concatenate([ref, ext])                          # [0, PHI_MAX] 기준 그리드 + (PHI_MAX, 1] 같은 간격 확장
     g201 = np.linspace(0.0, PHI_MAX, NUM_PHI)
-    print(f"[4장 하이브리드 검증] 표본 {num_samples}, 기준 그리드 {ref_points}점")
+    print(f"[4장 하이브리드 검증] 표본 {num_samples}, 기준 그리드 {ref_points}점 (상한 절단 확인용 확장 {len(ext)}점)")
     print(f"{'SNR(dB)':>7} | {'안전구간':>8} | {'손실 평균':>10} | {'손실 최대':>10} | "
-          f"{'201점 최대손실':>13} | {'평가횟수 평균':>12} | {'최대':>4}")
+          f"{'201점 최대손실':>13} | {'평가횟수 평균':>12} | {'최대':>4} | "
+          f"{'절단 채널(%)':>11} | {'절단 최대손실':>12} | {'절단 평균손실':>12}")
     for snr_db in snr_db_list:
         rho = 10 ** (snr_db / 10)
         A, B, D = generate_gains(rng, num_samples, rho, rho)
         phi, n_eval, safe = optimize_genie_hybrid(A, B, D)
         v_h = np.maximum(0, f_ch4(phi, A, B, D))
-        v_ref = np.empty(num_samples); v_201 = np.empty(num_samples)
+        v_ref = np.empty(num_samples); v_201 = np.empty(num_samples); v_full = np.empty(num_samples)
         for s0 in range(0, num_samples, 1000):                     # 메모리 절약용 청크
             sl = slice(s0, s0 + 1000)
             a, b, d = A[sl, None], B[sl, None], D[sl, None]
-            v_ref[sl] = np.maximum(0, f_ch4(ref[None, :], a, b, d)).max(1)
+            F = np.maximum(0, f_ch4(ref_full[None, :], a, b, d))
+            v_full[sl] = F.max(1)
+            v_ref[sl] = F[:, :ref_points].max(1)                    # [0, PHI_MAX] 기준값
             v_201[sl] = np.maximum(0, f_ch4(g201[None, :], a, b, d)).max(1)
         loss = v_ref - v_h
+        trunc = v_full - v_ref                                      # 상한 절단 손실 (>= 0, 기준값끼리 비교 -> 알고리즘 오차와 분리)
+        cut = trunc > 0                                             # [0, 1)의 최적해가 (PHI_MAX, 1)에 놓인 채널
         print(f"{snr_db:>7} | {safe.mean():>8.3f} | {loss.mean():>10.1e} | {loss.max():>10.1e} | "
-              f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4}")
+              f"{(v_ref - v_201).max():>13.1e} | {n_eval.mean():>12.1f} | {int(n_eval.max()):>4} | "
+              f"{cut.mean() * 100:>11.3f} | {trunc.max():>12.1e} | {trunc.mean():>12.1e}")
 
 
 def ergodic_E_Ce(phi_grid, rho_e, derivs=False):
