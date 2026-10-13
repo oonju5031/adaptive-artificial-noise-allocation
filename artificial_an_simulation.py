@@ -13,8 +13,9 @@ from scipy.special import exp1
 #   - Proposed(Eve의 CSI를 모르는 경우)
 #   - SNR-static(SNR마다 채널 통계로 정한 고정 phi, h 순시값에 따른 적응 없음)
 # - 평가 지표
-#   - 에르고딕 보안 용량: Genie는 E[[Cb-Ce]^+] (Eve CSI로 블록별 판정 가능)
-#     Fixed, Proposed는 달성 가능 전송률 E[1{전송}(Cb-Ce)] (h만으로 전송 여부 결정, 누설 블록 포함)
+#   - 에르고딕 보안 전송률: 모든 기법 E[[Cb-Ce]^+] (기법 간 차이는 phi 선택 방식뿐)
+#     Eve CSI 없이 phi를 h만으로 정해도 E[[Cb-Ce]^+]를 달성 가능 (Gopala et al. 2008, Thm. 2, 긴 코히런스 구간 가정)
+#     Proposed의 목적함수 Cb - E_g[Ce]는 이 값의 하한(Jensen)인 대리 목적함수
 #   - SOP: 블록별 P(Cb - Ce < Rs) (5.6절 닫힌형과 같은 정의)
 # ====================================
 
@@ -385,7 +386,8 @@ def verify_analysis(snr_db_list=(-10, 0, 10, 20, 30), phi_list=(0.0, 0.25, 0.5, 
     # 해석식 검증: 같은 양을 식과 Monte Carlo로 각각 구해 비교
     #   A. 5.3절 E_g[Ce](phi) 준닫힌형 vs MC (미리 정한 phi, 탐색 구간 전체)
     #   B. 5.6절 조건부 SOP 닫힌형 vs MC (미리 정한 phi, ||h||^2)
-    #   C. 고른 phi*에서 Proposed의 예측 성능(반해석) vs 실제 성능(MC)
+    #   C. 고른 phi*에서 목적함수 평균 E_h[Cb - E_g[Ce]] (반해석) vs E_h,g[Cb - Ce] (MC), SOP 예측 vs MC
+    #      phi*가 h에만 의존하므로 두 평균은 같아야 함 -> 목적함수 계산(E_g[Ce]) 검증
     # MC는 X, Y를 직접 뽑지 않고 실제 채널과 beamforming으로 만든 B, D를 사용 -> 5.2절 분포 유도까지 함께 검증
     # z: |식 - MC| / MC 표준오차 (대략 3 이하면 통계적 잡음 범위)
     rng = np.random.default_rng(seed)
@@ -426,8 +428,8 @@ def verify_analysis(snr_db_list=(-10, 0, 10, 20, 30), phi_list=(0.0, 0.25, 0.5, 
                 print(f"{snr_db:>7} | {phi:>5.2f} | {x:>7.1f} | {p_formula:>9.5f} | {mc:>9.5f} | {z:>5.2f}")
     print(f"  -> 최대 z = {worst_b:.2f}")
 
-    print(f"\n[해석식 검증 C] 고른 phi*에서 Proposed의 예측(반해석) vs 실제(MC)")
-    print(f"{'SNR(dB)':>7} | {'전송률 예측':>10} | {'전송률 MC':>9} | {'z':>5} | {'SOP 예측':>9} | {'SOP MC':>9} | {'z':>5}")
+    print(f"\n[해석식 검증 C] 고른 phi*에서 Proposed의 목적함수 평균(반해석) vs Cb - Ce 평균(MC), SOP 예측 vs MC")
+    print(f"{'SNR(dB)':>7} | {'목적함수 평균':>10} | {'Cb-Ce MC':>9} | {'z':>5} | {'SOP 예측':>9} | {'SOP MC':>9} | {'z':>5}")
     for snr_db in snr_db_list:
         rho = 10 ** (snr_db / 10)
         A, B, D = generate_gains(rng, num_samples, rho, rho)
@@ -435,9 +437,8 @@ def verify_analysis(snr_db_list=(-10, 0, 10, 20, 30), phi_list=(0.0, 0.25, 0.5, 
         phi, _, _, _ = optimize_proposed_hybrid(A, rho, g201, E, dE, d2E)
         c_bar = np.log2(1 + A * (1 - phi)) - np.interp(phi, g201, E)          # 목적함수 값 (h만으로 계산)
         d = f_ch4(phi, A, B, D)                                              # 실제 g 위의 Cb - Ce
-        r_mc_blocks = np.where(c_bar > 0, d, 0.0)
-        r_pred, r_mc = np.maximum(0.0, c_bar).mean(), r_mc_blocks.mean()
-        z_r = abs(r_pred - r_mc) / (r_mc_blocks.std() / np.sqrt(num_samples))
+        r_pred, r_mc = c_bar.mean(), d.mean()                               # E_h[E_g[f]] = E_h,g[f] (phi*는 h에만 의존)
+        z_r = abs(r_pred - r_mc) / (d.std() / np.sqrt(num_samples))
         s_pred, s_mc = sop_closed_form(A, phi, rho).mean(), np.mean(d < RS)
         se_s = np.sqrt(max(s_mc * (1 - s_mc), 1e-12) / num_samples)
         z_s = abs(s_pred - s_mc) / se_s
@@ -446,7 +447,7 @@ def verify_analysis(snr_db_list=(-10, 0, 10, 20, 30), phi_list=(0.0, 0.25, 0.5, 
 
 def optimize_static_phi(rho_b, phi_grid, E_Ce, n=STATIC_TRAIN_N, seed=STATIC_SEED, chunk=20000):
     # SNR-static: h 순시값 없이 채널 통계만으로 SNR당 하나의 phi 결정
-    #   phi_static = argmax_phi E_h[ [Cb(phi) - E_g[Ce](phi)]^+ ]  (달성 가능 전송률의 기댓값)
+    #   phi_static = argmax_phi E_h[ [Cb(phi) - E_g[Ce](phi)]^+ ]  (Proposed와 같은 대리 목적함수의 기댓값)
     # ||h||^2 ~ Gamma(Nt, 1) (h ~ CN(0, I), Nt=2) 독립 표본으로 E_h를 추정 -> 평가 표본과 분리해 편향 방지
     rng = np.random.default_rng(seed)
     acc = np.zeros(len(phi_grid))
@@ -483,31 +484,27 @@ def run_simulation(num_samples=NUM_SAMPLES, Rs=RS, sigma_b2=SIGMA_B2, sigma_e2=S
 
         # ===== 1. Fixed: 정보 신호와 인공 잡음 신호의 전력비 고정 (Eve CSI 없음) =====
         d_fixed = f_ch4(FIXED_PHI, A, B, D)                                   # 블록별 Cb - Ce
-        tx_fixed = np.log2(1 + A * (1 - FIXED_PHI)) - np.interp(FIXED_PHI, phi_grid, E_Ce) > 0  # h만으로 전송 여부
-        cs_fixed = np.where(tx_fixed, d_fixed, 0.0)                           # 달성 가능 (음수 블록 포함)
+        cs_fixed = np.maximum(0.0, d_fixed)                                   # [Cb - Ce]^+
 
         # ===== 1-2. SNR-static: SNR마다 채널 통계로 정한 고정 phi (Eve CSI 없음, h 적응 없음) =====
         phi_static = optimize_static_phi(rho_b, phi_grid, E_Ce)
         d_static = f_ch4(phi_static, A, B, D)
-        tx_static = np.log2(1 + A * (1 - phi_static)) - np.interp(phi_static, phi_grid, E_Ce) > 0
-        cs_static = np.where(tx_static, d_static, 0.0)                        # 달성 가능 (Fixed와 같은 규칙)
+        cs_static = np.maximum(0.0, d_static)
 
         # ===== 2. Genie-aided: Eve의 CSI를 알고 4장 조건부 하이브리드로 phi 선택 =====
         phi_genie, n_eval_genie, safe = optimize_genie_hybrid(A, B, D)
         d_genie = f_ch4(phi_genie, A, B, D)
-        cs_genie = np.maximum(0.0, d_genie)                                   # Eve CSI로 블록별 판정 가능
+        cs_genie = np.maximum(0.0, d_genie)
 
         # ===== 3. Proposed: Eve CSI(g) 미사용, 5장 목적함수 최대화로 phi 선택 =====
-        # 목적함수 C_bar(phi) = Cb(phi|h) - E_g[Ce](phi), phi*=0 판정(닫힌형) + 뉴턴법 (5.4, 5.5절)
+        # 대리 목적함수 Cb(phi|h) - E_g[Ce](phi) 최대화, phi*=0 판정(닫힌형) + 뉴턴법 (5장)
         phi_proposed, n_eval_prop, an_off, _ = optimize_proposed_hybrid(A, rho_e, phi_grid, E_Ce, dE_Ce, d2E_Ce)
         d_prop = f_ch4(phi_proposed, A, B, D)                                 # 실제 g 위에서의 블록별 Cb - Ce
-        c_bar_prop = np.log2(1 + A * (1 - phi_proposed)) - np.interp(phi_proposed, phi_grid, E_Ce)
-        tx_prop = c_bar_prop > 0                                              # h만으로 전송 여부
-        cs_proposed = np.where(tx_prop, d_prop, 0.0)                          # 달성 가능 (음수 블록 포함)
+        cs_proposed = np.maximum(0.0, d_prop)                                 # [Cb - Ce]^+ (phi는 h만으로 결정)
 
         # ----- SNR별 지표 집계 -----
         res["snr"].append(snr_db)
-        res["cs_fixed"].append(cs_fixed.mean())          # 에르고딕 보안 용량 (Fixed, Proposed: 달성 가능 전송률)
+        res["cs_fixed"].append(cs_fixed.mean())          # 에르고딕 보안 전송률 E[[Cb - Ce]^+]
         res["cs_genie"].append(cs_genie.mean())
         res["cs_static"].append(cs_static.mean())
         res["cs_proposed"].append(cs_proposed.mean())
@@ -598,7 +595,7 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
 
 
 if __name__ == "__main__":
-    # 검증
+    # 검증 (RUN_VERIFY = True일 때만)
     if RUN_VERIFY:
         verify_ch4_hybrid()
         verify_ch5_hybrid()
