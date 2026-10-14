@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.special import exp1
+from scipy.special import exp1, gammainc
+from scipy.special import gamma as gamma_fn
 
 # ====================================
 # 적응형 AN 전력 할당 시뮬레이션
@@ -48,6 +49,12 @@ NEWTON_GTOL = 1e-12     # 수렴 판정 (|f'| 크기)
 
 # 낮은 해상도 그리드 (4장 불확실성 구간, 5장 그리드 탐색이 필요한 경우 공통)
 LOW_RES_GRID_N = 11     # 낮은 해상도 그리드 점 수 (0~PHI_MAX 균등 분할)
+
+# 5장 (Eve 위치 불확실성): Eve는 Alice 중심 원 안에 면적 균일, 평균 SNR은 거리^-alpha에 비례
+PL_ALPHA = 3.0          # 경로 손실 지수
+EPS_LIST = (0.01, 0.1)  # SOP 제약 epsilon 대표값
+CH5_PHI_FINE_N = 4001   # q_eps(phi) 사전 계산 격자 점 수 (0~PHI_MAX)
+CH5_COARSE_STEP = 20    # 블록별 탐색의 거친 격자 간격 (정밀 격자 index 기준 -> 거친 격자 201점)
 # ------------------------------------
 
 
@@ -594,12 +601,157 @@ def plot_results(res, Rs=RS, num_samples=NUM_SAMPLES):
     plt.show()
 
 
+# ====================================
+# 5장: Eve 위치 불확실성 (원 모델)
+# - Eve는 Alice 중심 반지름 R인 원 안 어딘가에 면적 균일하게 위치, 위치는 전송 동안 고정이며 Alice는 모름
+#   -> rho_e = rho_edge * (r/R)^-alpha, rho_edge: 원 가장자리(가장 약한 위치) Eve의 평균 SNR
+# - 블록마다 Alice는 h를 알고 phi, R_b(=Cb), R_s를 정함. 제약: 위치·g 평균 SOP <= eps
+# - 성능: 보안 처리량 E_h[R_s] (Eve 순시 CSI가 있으면 E[Cs]가 되므로 4장 Genie가 상한)
+# ====================================
+
+
+def disk_L(s, rho_edge, alpha=PL_ALPHA):
+    # 위치 항 L(s) = E_r[exp(-s / rho_e(r))]
+    # 닫힌형: L(s) = d (rho_edge/s)^d * lower_gamma(d, s/rho_edge), d = 2/alpha (s -> 0이면 1)
+    d = 2.0 / alpha
+    x = np.maximum(np.asarray(s, dtype=float) / rho_edge, 1e-300)
+    return d * x ** (-d) * gammainc(d, x) * gamma_fn(d)
+
+
+def disk_dL(s, rho_edge, alpha=PL_ALPHA):
+    # L'(s) = -E[(1/rho_e) exp(-s/rho_e)] = -(d/rho_edge) x^(-d-1) lower_gamma(d+1, x), x = s/rho_edge
+    d = 2.0 / alpha
+    x = np.maximum(np.asarray(s, dtype=float) / rho_edge, 1e-300)
+    return -(d / rho_edge) * x ** (-d - 1) * gammainc(d + 1, x) * gamma_fn(d + 1)
+
+
+def eve_ccdf_disk(t, phi, rho_edge, alpha=PL_ALPHA):
+    # 위치·g 평균 Eve SINR 꼬리확률 P(gamma_e > t) = L(t/(1-phi)) / (1 + t phi/(1-phi))  (Nt=2)
+    # 분모(AN 항)는 위치와 무관, 위치 정보는 L에만 들어감
+    return disk_L(t / (1 - phi), rho_edge, alpha) / (1 + t * phi / (1 - phi))
+
+
+def sop_quantile_disk(phi_grid, eps, rho_edge, alpha=PL_ALPHA, iters=100):
+    # q_eps(phi): P(gamma_e > q) = eps인 분위수, q = (1-phi) s
+    # s는 L(s) = eps (1 + phi s)의 유일한 근 (좌변 감소, 우변 증가) -> log s 이분법 (phi 격자 전체 벡터화)
+    phi = np.asarray(phi_grid, dtype=float)
+    lo = np.full(phi.shape, -60.0)
+    hi = np.full(phi.shape, 60.0)
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        s = np.exp(mid)
+        left = disk_L(s, rho_edge, alpha) > eps * (1 + phi * s)    # 근보다 왼쪽
+        lo = np.where(left, mid, lo)
+        hi = np.where(left, hi, mid)
+    return (1 - phi) * np.exp(0.5 * (lo + hi))
+
+
+def generate_gains_disk(rng, n, rho_b, rho_edge, alpha=PL_ALPHA):
+    # 표본마다 Eve 위치를 원 안 면적 균일로 생성: (r/R)^2 = u ~ U(0, 1] -> rho_e = rho_edge * u^(-alpha/2)
+    u = 1.0 - rng.uniform(size=n)                                   # (0, 1] (u = 0 제외)
+    rho_e = rho_edge * u ** (-alpha / 2)
+    A, B, D = generate_gains(rng, n, rho_b, rho_e)                  # B, D는 표본별 rho_e로 계산 (식 3.8)
+    return A, B, D, rho_e
+
+
+def optimize_ch5_disk(A, phi_fine, q_fine, coarse_step=CH5_COARSE_STEP, chunk=20000):
+    # 블록별 R_s(phi) = log2(1 + A(1-phi)) - log2(1 + q_eps(phi)) 최대화 (q_eps는 h와 무관 -> 사전 계산해 공유)
+    # R_s(phi)의 내부 극대점은 하나 이하(수치 확인) -> 거친 격자 argmax 후 이웃 구간에서 정밀 격자 argmax
+    n = len(A)
+    idx_c = np.arange(0, len(phi_fine), coarse_step)
+    lq = np.log2(1 + q_fine)
+    offs = np.arange(-coarse_step, coarse_step + 1)
+    phi_opt = np.empty(n)
+    rs_opt = np.empty(n)
+    for s0 in range(0, n, chunk):
+        a = A[s0:s0 + chunk, None]
+        rc = np.log2(1 + a * (1 - phi_fine[idx_c][None, :])) - lq[idx_c][None, :]
+        kc = idx_c[rc.argmax(1)]
+        win = np.clip(kc[:, None] + offs[None, :], 0, len(phi_fine) - 1)
+        rf = np.log2(1 + a * (1 - phi_fine[win])) - lq[win]
+        j = rf.argmax(1)
+        rows = np.arange(len(kc))
+        phi_opt[s0:s0 + chunk] = phi_fine[win[rows, j]]
+        rs_opt[s0:s0 + chunk] = np.maximum(0.0, rf[rows, j])         # R_s <= 0이면 전송하지 않음
+    return phi_opt, rs_opt
+
+
+def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), eps_list=EPS_LIST,
+                    num_samples=200000, seed=3, alpha=PL_ALPHA):
+    # 5장 해석식 검증
+    #   A. 위치 항 L(s): 닫힌형 vs 수치적분 (Gauss-Legendre)
+    #   B. 위치·g 평균 Eve SINR 꼬리확률: 해석식 vs MC (실제 h, g, 위치 표본)
+    #   C. 설계한 (phi*, R_b, R_s)에서 전송 블록의 실제 누설 비율(MC)이 eps와 같은지
+    rng = np.random.default_rng(seed)
+    glx, glw = np.polynomial.legendre.leggauss(4000)
+    u, w = (glx + 1) / 2, glw / 2
+    print(f"[5장 해석식 검증 A] 위치 항 L(s): 닫힌형 vs 수치적분 (alpha = {alpha})")
+    print(f"{'rho_edge(dB)':>12} | {'최대 상대오차':>12}")
+    for re_db in rho_edge_db_list:
+        re = 10 ** (re_db / 10)
+        ss = np.geomspace(1e-3, 1e3, 25) * re
+        num = np.array([np.sum(w * np.exp(-s * u ** (alpha / 2) / re)) for s in ss])
+        print(f"{re_db:>12} | {np.max(np.abs(disk_L(ss, re, alpha) / num - 1)):>12.1e}")
+
+    print(f"\n[5장 해석식 검증 B] Eve SINR 꼬리확률: 해석식 vs MC (표본 {num_samples})")
+    print(f"{'rho_edge(dB)':>12} | {'phi':>4} | {'P 해석':>9} | {'P MC':>9} | {'z':>5}")
+    for re_db in rho_edge_db_list:
+        re = 10 ** (re_db / 10)
+        _, B, D, _ = generate_gains_disk(rng, num_samples, 1.0, re, alpha)
+        for phi in (0.1, 0.5, 0.9):
+            for p_target in (0.5, 0.1, 0.01):
+                t = sop_quantile_disk(np.array([phi]), p_target, re, alpha)[0]   # 꼬리확률이 p_target이 되는 t
+                p_an = eve_ccdf_disk(t, phi, re, alpha)
+                p_mc = np.mean(B * (1 - phi) / (1 + D * phi) > t)
+                z = abs(p_an - p_mc) / np.sqrt(p_an * (1 - p_an) / num_samples)
+                print(f"{re_db:>12} | {phi:>4.1f} | {p_an:>9.5f} | {p_mc:>9.5f} | {z:>5.2f}")
+
+    print(f"\n[5장 해석식 검증 C] 설계한 (phi*, R_b, R_s)에서 전송 블록의 누설 비율 (표본 {num_samples})")
+    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'전송 비율':>9} | {'누설 비율 MC':>11} | {'z':>5} | {'보안 처리량':>10}")
+    phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
+    for rb_db in rho_b_db_list:
+        rho_b = 10 ** (rb_db / 10)
+        for re_db in rho_edge_db_list:
+            re = 10 ** (re_db / 10)
+            A, B, D, _ = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
+            for eps in eps_list:
+                q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
+                phi_opt, rs = optimize_ch5_disk(A, phi_fine, q_fine)
+                tx = rs > 0
+                q_opt = np.interp(phi_opt, phi_fine, q_fine)          # phi_opt는 격자점 -> 정확히 q_eps(phi*)
+                leak = (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)[tx]   # Ce > R_b - R_s  <=>  gamma_e > q_eps(phi*)
+                if tx.sum() == 0:                                      # 전송 블록 없음 -> 누설 비율 정의되지 않음
+                    print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {'-':>11} | {'-':>5} | {rs.mean():>10.4f}")
+                    continue
+                p_leak = leak.mean()
+                z = abs(p_leak - eps) / np.sqrt(eps * (1 - eps) / tx.sum())
+                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {p_leak:>11.5f} | {z:>5.2f} | {rs.mean():>10.4f}")
+
+    print(f"\n[5장 해석식 검증 D] 블록별 탐색(거친 격자 + 이웃 정밀 격자) vs 정밀 격자 전수 탐색 ({CH5_PHI_FINE_N}점)")
+    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'손실 최대':>10}")
+    n_d = 20000
+    for rb_db in rho_b_db_list:
+        rho_b = 10 ** (rb_db / 10)
+        A = rho_b * rng.gamma(NT, 1.0, size=n_d)                       # ||h||^2 ~ Gamma(Nt, 1)
+        for re_db in rho_edge_db_list:
+            re = 10 ** (re_db / 10)
+            for eps in eps_list:
+                q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
+                _, rs = optimize_ch5_disk(A, phi_fine, q_fine)
+                full = np.empty(n_d)
+                for s0 in range(0, n_d, 2000):                         # 메모리 절약용 청크
+                    a = A[s0:s0 + 2000, None]
+                    full[s0:s0 + 2000] = np.maximum(0.0, (np.log2(1 + a * (1 - phi_fine[None, :])) - np.log2(1 + q_fine)[None, :]).max(1))
+                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {(full - rs).max():>10.1e}")
+
+
 if __name__ == "__main__":
     # 검증 (RUN_VERIFY = True일 때만)
     if RUN_VERIFY:
         verify_ch4_hybrid()
         verify_ch5_hybrid()
         verify_analysis()
+        verify_ch5_disk()
 
     # 시뮬레이션 수행
     plot_results(run_simulation())
