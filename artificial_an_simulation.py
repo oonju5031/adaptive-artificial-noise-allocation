@@ -11,17 +11,18 @@ from scipy.special import gamma as gamma_fn
 #   - 4장: Alice가 Eve의 순시 CSI를 아는 경우 (Genie-aided, 성능 상한)
 #   - 5장: Eve의 위치가 불확실한 경우. Eve는 Alice 중심 원 안 어딘가에 면적 균일하게 위치 (원 모델)
 # - 비교 (6장)
-#   - Genie-aided: Eve의 순시 CSI(위치 포함)를 알고 블록마다 4장 알고리즘으로 phi 선택 -> 상한 E[Cs]
-#   - Proposed: 위치·g 평균 SOP <= eps 아래 블록마다 phi, R_s 선택
-#   - Noiseless: Eve 수신 잡음 0 가정(기존 연구의 Eve 가정)으로 블록마다 phi, R_s 선택
-#                -> 원 안 모든 위치에서 SOP <= eps 보장. Proposed와 Eve 가정만 다름 (위치 정보의 가치)
-#   - Noiseless-phi: Noiseless의 phi를 쓰고 R_s는 실제 위치 분포로 선택 (SOP = eps)
+#   - Genie: Eve의 순시 CSI(위치 포함)를 알고 블록마다 4장 알고리즘으로 phi 선택 -> 상한 (R_s = Cs, 보안 처리량 = Cs의 평균)
+#   - Proposed: 위치·g 평균 SOP p_so <= eps 아래 블록마다 phi, R_s 선택
+#   - Agnostic-phi: phi는 위치 정보 없이(Eve 수신 잡음 0, 가장 가까운 Eve 가정) 정하고 R_s는 위치 분포로 선택 (p_so = eps)
 #                -> Proposed와 phi 선택만 다름 (위치 정보에 맞춘 phi 선택 자체의 가치)
-#   - Static: Proposed의 phi를 h와 무관하게 하나로 고정, R_s는 블록마다 (SOP = eps)
-#                -> Proposed와 phi의 블록 적응 여부만 다름 (결과는 표로만 출력)
-# - 평가 지표
-#   - 보안 처리량 E_h[R_s] (bps/Hz): 블록마다 R_b = Cb(phi), R_s = R_b - log2(1 + q_eps(phi)), R_s <= 0이면 전송 안 함
-#   - 전송 블록의 실제 누설 비율 (MC, 설계한 SOP 확인용)
+#   - Agnostic: phi, R_s 모두 위치 정보 없이 선택 (기존 연구의 Eve 가정) -> 원 안 모든 위치에서 p_so <= eps
+#                -> Agnostic-phi와의 차이는 R_s(보장 수준)의 몫
+#   - Static (표로만 출력): Proposed의 phi를 h와 무관하게 하나로 고정, R_s는 블록마다 (p_so = eps)
+#                -> Proposed와 phi의 블록 적응 여부만 다름
+# - 평가 지표 (논문 표기)
+#   - 보안 처리량 R_s의 평균 (bps/Hz): 블록마다 R_b = Cb(phi), R_s = [f_eps(phi*)]^+,
+#     f_eps(phi) = Cb(phi) - log2(1 + theta_eps(phi)), theta_eps: p_so = eps가 되는 SINR_e 문턱값
+#   - 전송 블록의 실제 누설 비율 (MC, 설계한 p_so 확인용)
 # ====================================
 
 
@@ -50,12 +51,12 @@ LOW_RES_GRID_N = 11     # 낮은 해상도 그리드 점 수 (0~PHI_MAX 균등 �
 # 5장 (Eve 위치 불확실성): Eve는 Alice 중심 원 안에 면적 균일, 평균 SNR은 거리^-alpha에 비례
 PL_ALPHA = 3.0          # 경로 손실 지수
 EPS_LIST = (0.01, 0.1)  # SOP 제약 epsilon 대표값
-CH5_PHI_FINE_N = 4001   # q_eps(phi) 사전 계산 격자 점 수 (0~PHI_MAX)
+CH5_PHI_FINE_N = 4001   # theta_eps(phi) 사전 계산 격자 점 수 (0~PHI_MAX)
 CH5_COARSE_STEP = 20    # 블록별 탐색의 거친 격자 간격 (정밀 격자 index 기준 -> 거친 격자 201점)
 
 # 6장 시뮬레이션 구간
 RHO_B_DB_LIST = (10, 20)                    # Bob 송신 SNR rho_b (dB)
-RHO_EDGE_DB_RANGE = np.arange(-20, 21, 5)   # 원 가장자리(가장 약한 위치) Eve의 평균 SNR rho_edge (dB)
+RHO_EDGE_DB_RANGE = np.arange(-20, 21, 5)   # 원 가장자리(가장 약한 위치) Eve의 평균 SNR rho_edge (dB), 논문의 rho_e
 # ------------------------------------
 
 
@@ -248,92 +249,94 @@ def verify_ch4_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_po
 
 # ====================================
 # 5장: Eve 위치 불확실성 (원 모델)
-# - Eve는 Alice 중심 반지름 R인 원 안 어딘가에 면적 균일하게 위치, 위치는 전송 동안 고정이며 Alice는 모름
-#   -> rho_e = rho_edge * (r/R)^-alpha, rho_edge: 원 가장자리(가장 약한 위치) Eve의 평균 SNR
-# - 블록마다 Alice는 h를 알고 phi, R_b(=Cb), R_s를 정함. 제약: 위치·g 평균 SOP <= eps
-# - 성능: 보안 처리량 E_h[R_s] (Eve 순시 CSI가 있으면 E[Cs]가 되므로 4장 Genie가 상한)
+# - Eve는 Alice 중심 반지름 r0인 원 안 어딘가에 면적 균일하게 위치, 위치는 전송 동안 고정이며 Alice는 모름
+#   -> Eve의 평균 SNR = rho_edge * (r/r0)^-alpha (코드의 rho_edge = 논문의 rho_e, 원 가장자리 Eve의 평균 SNR)
+# - 블록마다 Alice는 h를 알고 phi, R_b(=Cb), R_s를 정함. 제약: 위치·g 평균 SOP p_so <= eps
+# - 성능: 보안 처리량 (Eve 순시 CSI가 있으면 R_s = Cs이므로 4장 Genie가 상한)
+# - 코드 변수와 논문 표기: tau (L의 인자, tau = theta/(1-phi)), q_* = theta_eps(phi) (SINR_e 문턱값)
 # ====================================
 
 
-def disk_L(s, rho_edge, alpha=PL_ALPHA):
-    # 위치 항 L(s) = E_r[exp(-s / rho_e(r))]
-    # 닫힌형: L(s) = d (rho_edge/s)^d * lower_gamma(d, s/rho_edge), d = 2/alpha (s -> 0이면 1)
+def disk_L(tau, rho_edge, alpha=PL_ALPHA):
+    # 위치 평균 항 L(tau) = E_r[exp(-(tau/rho_e)(r/r0)^alpha)] (거리 r에 대해 평균한 결과)
+    # 닫힌형: L(tau) = d (rho_edge/tau)^d * lower_gamma(d, tau/rho_edge), d = 2/alpha (tau -> 0이면 1)
     d = 2.0 / alpha
-    x = np.maximum(np.asarray(s, dtype=float) / rho_edge, 1e-300)
+    x = np.maximum(np.asarray(tau, dtype=float) / rho_edge, 1e-300)
     return d * x ** (-d) * gammainc(d, x) * gamma_fn(d)
 
 
-def disk_dL(s, rho_edge, alpha=PL_ALPHA):
-    # L'(s) = -E[(1/rho_e) exp(-s/rho_e)] = -(d/rho_edge) x^(-d-1) lower_gamma(d+1, x), x = s/rho_edge
+def disk_dL(tau, rho_edge, alpha=PL_ALPHA):
+    # L'(tau) = -(d/rho_edge) x^(-d-1) lower_gamma(d+1, x), x = tau/rho_edge
     d = 2.0 / alpha
-    x = np.maximum(np.asarray(s, dtype=float) / rho_edge, 1e-300)
+    x = np.maximum(np.asarray(tau, dtype=float) / rho_edge, 1e-300)
     return -(d / rho_edge) * x ** (-d - 1) * gammainc(d + 1, x) * gamma_fn(d + 1)
 
 
-def eve_ccdf_disk(t, phi, rho_edge, alpha=PL_ALPHA):
-    # 위치·g 평균 Eve SINR 꼬리확률 P(gamma_e > t) = L(t/(1-phi)) / (1 + t phi/(1-phi))  (Nt=2)
+def eve_ccdf_disk(theta, phi, rho_edge, alpha=PL_ALPHA):
+    # 위치·g 평균 꼬리확률 P(SINR_e > theta) = L(tau) / (1 + phi tau), tau = theta/(1-phi)  (Nt=2)
     # 분모(AN 항)는 위치와 무관, 위치 정보는 L에만 들어감
-    return disk_L(t / (1 - phi), rho_edge, alpha) / (1 + t * phi / (1 - phi))
+    tau = theta / (1 - phi)
+    return disk_L(tau, rho_edge, alpha) / (1 + phi * tau)
 
 
 def sop_quantile(phi_grid, eps, L_fun, iters=100):
-    # q_eps(phi): P(gamma_e > q) = eps인 분위수, q = (1-phi) s
-    # s는 L(s) = eps (1 + phi s)의 유일한 근 (좌변 감소, 우변 증가) -> log s 이분법 (phi 격자 전체 벡터화)
-    # L_fun: 위치 항 L(s) = E[exp(-s/rho_e)] (rho_e의 분포만 바꾸면 그대로 적용)
+    # theta_eps(phi): P(SINR_e > theta) = eps가 되는 문턱값, theta_eps = (1-phi) tau
+    # tau는 L(tau) = eps (1 + phi tau)의 유일한 근 (좌변 감소, 우변 증가) -> log tau 이분법 (phi 격자 전체 벡터화)
+    # L_fun: 위치 평균 항 L(tau) (rho_e의 분포만 바꾸면 그대로 적용)
     phi = np.asarray(phi_grid, dtype=float)
     lo = np.full(phi.shape, -60.0)
     hi = np.full(phi.shape, 60.0)
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
-        s = np.exp(mid)
-        left = L_fun(s) > eps * (1 + phi * s)                       # 근보다 왼쪽
+        tau = np.exp(mid)
+        left = L_fun(tau) > eps * (1 + phi * tau)                   # 근보다 왼쪽
         lo = np.where(left, mid, lo)
         hi = np.where(left, hi, mid)
     return (1 - phi) * np.exp(0.5 * (lo + hi))
 
 
 def sop_quantile_disk(phi_grid, eps, rho_edge, alpha=PL_ALPHA):
-    # 원 모델의 분위수
-    return sop_quantile(phi_grid, eps, lambda s: disk_L(s, rho_edge, alpha))
+    # 원 모델의 theta_eps(phi)
+    return sop_quantile(phi_grid, eps, lambda tau: disk_L(tau, rho_edge, alpha))
 
 
 def sop_quantile_fixed(phi_grid, eps, rho_e):
-    # rho_e를 값 하나로 볼 때의 분위수 (L(s) = exp(-s/rho_e))
-    return sop_quantile(phi_grid, eps, lambda s: np.exp(-s / rho_e))
+    # Eve의 평균 SNR을 값 하나로 볼 때의 theta_eps(phi) (L(tau) = exp(-tau/rho_e))
+    return sop_quantile(phi_grid, eps, lambda tau: np.exp(-tau / rho_e))
 
 
 def sop_quantile_noiseless(phi_grid, eps):
-    # Eve 수신 잡음 0 (rho_e -> inf): P(gamma_e > t) = 1/(1 + t phi/(1-phi)) -> q = (1-phi)(1-eps)/(phi eps)
-    # 원 안 모든 위치에 대해 SOP <= eps를 보장하는 분위수 (rho_e가 클수록 Eve가 강하므로 상한)
+    # Eve 수신 잡음 0 (가장 가까운 Eve, 평균 SNR -> inf): P(SINR_e > theta) = 1/(1 + theta phi/(1-phi))
+    # -> theta_eps = (1-phi)(1-eps)/(phi eps). 원 안 모든 위치에서 p_so <= eps를 보장 (Agnostic 기법)
     phi = np.asarray(phi_grid, dtype=float)
     with np.errstate(divide="ignore"):
         return np.where(phi > 0, (1 - phi) * (1 - eps) / (phi * eps), np.inf)   # phi = 0이면 보안 전송 불가
 
 
 def harmonic_mean_disk(rho_edge, alpha=PL_ALPHA):
-    # 원 모델에서 rho_e의 조화평균 1/E[1/rho_e] = (1 + alpha/2) rho_edge (산술평균은 발산)
-    # rho_eff(s)의 s -> 0 극한
+    # 원 모델에서 Eve 평균 SNR의 조화평균 1/E[1/rho] = (1 + alpha/2) rho_edge (산술평균은 발산)
+    # rho_eff(tau)의 tau -> 0 극한
     return (1 + alpha / 2) * rho_edge
 
 
-def rho_eff_disk(s, rho_edge, alpha=PL_ALPHA):
-    # 등가 SNR rho_eff(s) = -s / ln L(s): 같은 s에서 위치 항 L(s)와 같은 값을 주는 단일 rho_e
-    # 분위수 방정식 L(s) = eps(1 + phi s)에서 L(s) = exp(-s/rho_eff)로 바꿔도 근이 같음
-    # -> q_eps(phi)는 rho_e = rho_eff(s(phi))인 단일 SNR의 분위수와 정확히 같음
-    # ln L(s)가 s에 대해 볼록(누적생성함수) -> rho_eff(s)는 s에 대해 증가, s -> 0이면 조화평균, s -> inf이면 rho_max
-    return -np.asarray(s, dtype=float) / np.log(disk_L(s, rho_edge, alpha))
+def rho_eff_disk(tau, rho_edge, alpha=PL_ALPHA):
+    # 등가 SNR rho_eff(tau) = -tau / ln L(tau): 같은 tau에서 L(tau)와 같은 값을 주는 단일 평균 SNR
+    # 분위수 방정식 L(tau) = eps(1 + phi tau)에서 L(tau) = exp(-tau/rho_eff)로 바꿔도 근이 같음
+    # -> theta_eps(phi)는 평균 SNR이 rho_eff(tau(phi))인 고정 Eve의 문턱값과 정확히 같음
+    # ln L(tau)가 tau에 대해 볼록(누적생성함수) -> rho_eff는 tau에 대해 증가, tau -> 0이면 조화평균, tau -> inf이면 최대값
+    return -np.asarray(tau, dtype=float) / np.log(disk_L(tau, rho_edge, alpha))
 
 
 def an_on_threshold_disk(eps, rho_edge, alpha=PL_ALPHA):
-    # AN 사용 조건: A/(1+A) < T 이면 phi* > 0 (R_s*(phi)의 phi = 0에서의 기울기 > 0)
-    #   T = s0 (1 + eps/|L'(s0)|) / (1 + s0),  s0 = L^{-1}(eps) (phi = 0의 분위수)
+    # AN 사용 조건: A/(1+A) < T 이면 phi* > 0 (f_eps(phi)의 phi = 0에서의 기울기 > 0)
+    #   T = tau0 (1 + eps/|L'(tau0)|) / (1 + tau0),  tau0 = L^{-1}(eps) (phi = 0이면 theta = tau)
     # T >= 1이면 모든 A에서 AN 사용
-    s0 = sop_quantile_disk(np.array([0.0]), eps, rho_edge, alpha)[0]           # phi = 0이면 q = s
-    return s0 * (1 + eps / abs(disk_dL(s0, rho_edge, alpha))) / (1 + s0)
+    tau0 = sop_quantile_disk(np.array([0.0]), eps, rho_edge, alpha)[0]
+    return tau0 * (1 + eps / abs(disk_dL(tau0, rho_edge, alpha))) / (1 + tau0)
 
 
 def generate_gains_disk(rng, n, rho_b, rho_edge, alpha=PL_ALPHA):
-    # 표본마다 Eve 위치를 원 안 면적 균일로 생성: (r/R)^2 = u ~ U(0, 1] -> rho_e = rho_edge * u^(-alpha/2)
+    # 표본마다 Eve 위치를 원 안 면적 균일로 생성: (r/r0)^2 = u ~ U(0, 1] -> 평균 SNR = rho_edge * u^(-alpha/2)
     u = 1.0 - rng.uniform(size=n)                                   # (0, 1] (u = 0 제외)
     rho_e = rho_edge * u ** (-alpha / 2)
     A, B, D = generate_gains(rng, n, rho_b, rho_e)                  # B, D는 표본별 rho_e로 계산 (식 3.8)
@@ -341,8 +344,9 @@ def generate_gains_disk(rng, n, rho_b, rho_edge, alpha=PL_ALPHA):
 
 
 def optimize_ch5_disk(A, phi_fine, q_fine, coarse_step=CH5_COARSE_STEP, chunk=20000):
-    # 블록별 R_s(phi) = log2(1 + A(1-phi)) - log2(1 + q_eps(phi)) 최대화 (q_eps는 h와 무관 -> 사전 계산해 공유)
-    # R_s(phi)의 내부 극대점은 하나 이하(수치 확인) -> 거친 격자 argmax 후 이웃 구간에서 정밀 격자 argmax
+    # 블록별 f_eps(phi) = log2(1 + A(1-phi)) - log2(1 + theta_eps(phi)) 최대화, R_s = [f_eps(phi*)]^+
+    # (q_fine = theta_eps(phi)는 h와 무관 -> 사전 계산해 공유)
+    # f_eps의 내부 극대점은 하나 이하(수치 확인) -> 거친 격자 argmax 후 이웃 구간에서 정밀 격자 argmax
     n = len(A)
     idx_c = np.arange(0, len(phi_fine), coarse_step)
     lq = np.log2(1 + q_fine)
@@ -363,7 +367,7 @@ def optimize_ch5_disk(A, phi_fine, q_fine, coarse_step=CH5_COARSE_STEP, chunk=20
 
 
 def rs_at_phi(A, phi, phi_fine, q_fine):
-    # 정해진 phi(블록별 또는 고정)에서 실제 분위수로 정한 R_s = [log2(1 + A(1-phi)) - log2(1 + q_eps(phi))]^+
+    # 정해진 phi(블록별 또는 고정)에서 실제 위치 분포의 theta_eps로 정한 R_s = [log2(1 + A(1-phi)) - log2(1 + theta_eps(phi))]^+
     return np.maximum(0.0, np.log2(1 + A * (1 - phi)) - np.log2(1 + np.interp(phi, phi_fine, q_fine)))
 
 
@@ -390,13 +394,13 @@ def optimize_static_ch5(rho_b, phi_fine, q_fine, coarse_step=CH5_COARSE_STEP, n=
 def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), eps_list=EPS_LIST,
                     num_samples=200000, seed=3, alpha=PL_ALPHA):
     # 5장 해석식 검증
-    #   A. 위치 항 L(s): 닫힌형 vs 수치적분 (Gauss-Legendre)
+    #   A. 위치 평균 항 L(tau): 닫힌형 vs 수치적분 (Gauss-Legendre)
     #   B. 위치·g 평균 Eve SINR 꼬리확률: 해석식 vs MC (실제 h, g, 위치 표본)
     #   C. 설계한 (phi*, R_b, R_s)에서 전송 블록의 실제 누설 비율(MC)이 eps와 같은지
     rng = np.random.default_rng(seed)
     glx, glw = np.polynomial.legendre.leggauss(4000)
     u, w = (glx + 1) / 2, glw / 2
-    print(f"[5장 해석식 검증 A] 위치 항 L(s): 닫힌형 vs 수치적분 (alpha = {alpha})")
+    print(f"[5장 해석식 검증 A] 위치 평균 항 L(tau): 닫힌형 vs 수치적분 (alpha = {alpha})")
     print(f"{'rho_edge(dB)':>12} | {'최대 상대오차':>12}")
     for re_db in rho_edge_db_list:
         re = 10 ** (re_db / 10)
@@ -429,8 +433,8 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
                 q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
                 phi_opt, rs = optimize_ch5_disk(A, phi_fine, q_fine)
                 tx = rs > 0
-                q_opt = np.interp(phi_opt, phi_fine, q_fine)          # phi_opt는 격자점 -> 정확히 q_eps(phi*)
-                leak = (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)[tx]   # Ce > R_b - R_s  <=>  gamma_e > q_eps(phi*)
+                q_opt = np.interp(phi_opt, phi_fine, q_fine)          # phi_opt는 격자점 -> 정확히 theta_eps(phi*)
+                leak = (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)[tx]   # Ce > R_b - R_s  <=>  SINR_e > theta_eps(phi*)
                 if tx.sum() == 0:                                      # 전송 블록 없음 -> 누설 비율 정의되지 않음
                     print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {'-':>11} | {'-':>5} | {rs.mean():>10.4f}")
                     continue
@@ -470,31 +474,31 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
             print(f"{re_db:>12} | {eps:>5.2f} | {T:>9.3f} | {rng_txt:>16} | {int(np.sum(brute_on != pred_on)):>3}/{len(A_sweep)}")
 
     print(f"\n[5장 해석식 검증 F] 등가 SNR rho_eff: 분위수 등가성, 단조성, 조화평균 극한")
-    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'q 등가 최대 상대오차':>18} | {'단조 증가':>8} | {'rho_eff(s->0)/조화평균':>21}")
-    s_scan = np.geomspace(1e-6, 1e6, 200)
+    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'theta 등가 최대 상대오차':>18} | {'단조 증가':>8} | {'rho_eff(tau->0)/조화평균':>21}")
+    tau_scan = np.geomspace(1e-6, 1e6, 200)
     for re_db in rho_edge_db_list:
         re = 10 ** (re_db / 10)
-        r_eff = rho_eff_disk(s_scan * re, re, alpha)
+        r_eff = rho_eff_disk(tau_scan * re, re, alpha)
         mono = bool(np.all(np.diff(r_eff) > 0))
         lim = r_eff[0] / harmonic_mean_disk(re, alpha)
         for eps in eps_list:
             phis = np.linspace(0.0, 0.95, 20)
             q_disk = sop_quantile_disk(phis, eps, re, alpha)
-            s_phi = q_disk / (1 - phis)
-            q_equiv = np.array([sop_quantile_fixed(np.array([p]), eps, rho_eff_disk(s, re, alpha))[0] for p, s in zip(phis, s_phi)])
+            tau_phi = q_disk / (1 - phis)
+            q_equiv = np.array([sop_quantile_fixed(np.array([p]), eps, rho_eff_disk(t, re, alpha))[0] for p, t in zip(phis, tau_phi)])
             print(f"{re_db:>12} | {eps:>5.2f} | {np.max(np.abs(q_equiv / q_disk - 1)):>18.1e} | {str(mono):>8} | {lim:>21.6f}")
 
 
 # ====================================
 # 6장: 원 모델에서의 기법 비교
 # ====================================
-SCHEMES = ("genie", "proposed", "noiseless_phi", "noiseless", "static")
-PLOT_SCHEMES = ("genie", "proposed", "noiseless_phi", "noiseless")     # Static은 Proposed와 겹쳐 표로만 출력
+SCHEMES = ("genie", "proposed", "agnostic_phi", "agnostic", "static")
+PLOT_SCHEMES = ("genie", "proposed", "agnostic_phi", "agnostic")     # Static은 Proposed와 겹쳐 표로만 출력
 SCHEME_STYLE = {   # 라벨, 색, 선·마커 (기법별 통일)
-    "genie":         ("Genie-aided (Eve CSI)", "#10b981", "^-."),
+    "genie":         ("Genie", "#10b981", "^-."),
     "proposed":      ("Proposed", "#3b82f6", "s-"),
-    "noiseless_phi": ("Noiseless-Eve phi + true R_s", "#f59e0b", "o--"),
-    "noiseless":     ("Noiseless-Eve design (all positions)", "#ef4444", "v--"),
+    "agnostic_phi": ("Agnostic-φ", "#f59e0b", "o--"),
+    "agnostic":     ("Agnostic", "#ef4444", "v--"),
     "static":        ("Static (fixed phi)", "#8b5cf6", "x:"),
 }
 
@@ -505,7 +509,7 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     # (rho_b, rho_edge)마다 채널·위치 표본을 한 번 생성해 eps와 모든 기법이 공유
     rng = np.random.default_rng(seed)
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
-    q_noiseless = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
+    q_agnostic = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
     res = {(rb, eps): {"rho_edge": [], **{f"{m}_{k}": [] for m in ("eta", "phi", "leak") for k in SCHEMES}}
            for rb in rho_b_db_list for eps in eps_list}
 
@@ -522,13 +526,13 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
 
             for eps in eps_list:
                 q_true = sop_quantile_disk(phi_fine, eps, re, alpha)                    # 실제 위치 분포의 분위수
-                phi_n, rs_n = optimize_ch5_disk(A, phi_fine, q_noiseless[eps])          # Eve 수신 잡음 0 가정 설계
+                phi_n, rs_n = optimize_ch5_disk(A, phi_fine, q_agnostic[eps])          # Agnostic: Eve 수신 잡음 0(가장 가까운 Eve) 가정 설계
                 phi_s = optimize_static_ch5(rho_b, phi_fine, q_true)
                 out = {
                     "genie":         (phi_g, rs_g),
                     "proposed":      optimize_ch5_disk(A, phi_fine, q_true),
-                    "noiseless_phi": (phi_n, rs_at_phi(A, phi_n, phi_fine, q_true)),    # phi는 수신 잡음 0 가정, R_s는 실제 분포
-                    "noiseless":     (phi_n, rs_n),                                     # phi, R_s 모두 수신 잡음 0 가정
+                    "agnostic_phi": (phi_n, rs_at_phi(A, phi_n, phi_fine, q_true)),    # Agnostic-phi: phi는 수신 잡음 0 가정, R_s는 실제 분포
+                    "agnostic":     (phi_n, rs_n),                                     # Agnostic: phi, R_s 모두 수신 잡음 0 가정
                     "static":        (np.full(num_samples, phi_s), rs_at_phi(A, phi_s, phi_fine, q_true)),
                 }
                 r = res[(rb_db, eps)]
@@ -547,11 +551,11 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     for (rb_db, eps), r in res.items():
         print(f"\n[rho_b = {rb_db} dB, eps = {eps}] 보안 처리량 (bps/Hz), 전송 블록 평균 phi, 전송 블록의 실제 누설 비율")
         print(f"{'rho_edge':>8} | " + " | ".join(f"{k:>13}" for k in SCHEMES)
-              + f" | {'phi(P)':>6} | {'phi(N)':>6} | {'누설(P)':>7} | {'누설(N-phi)':>9} | {'누설(N)':>7}")
+              + f" | {'phi(P)':>6} | {'phi(A)':>6} | {'누설(P)':>7} | {'누설(A-phi)':>9} | {'누설(A)':>7}")
         for i, re_db in enumerate(r["rho_edge"]):
             print(f"{re_db:>8} | " + " | ".join(f"{r[f'eta_{k}'][i]:>13.4f}" for k in SCHEMES)
-                  + f" | {r['phi_proposed'][i]:>6.3f} | {r['phi_noiseless'][i]:>6.3f} | {r['leak_proposed'][i]:>7.4f}"
-                  + f" | {r['leak_noiseless_phi'][i]:>9.4f} | {r['leak_noiseless'][i]:>7.4f}")
+                  + f" | {r['phi_proposed'][i]:>6.3f} | {r['phi_agnostic'][i]:>6.3f} | {r['leak_proposed'][i]:>7.4f}"
+                  + f" | {r['leak_agnostic_phi'][i]:>9.4f} | {r['leak_agnostic'][i]:>7.4f}")
         gap = 100 * (1 - np.array(r["eta_static"]) / np.array(r["eta_proposed"]))
         print(f"  Static의 Proposed 대비 손실: 최대 {np.nanmax(gap):.2f}% (phi 블록 적응의 이득)")
     return res
@@ -570,9 +574,9 @@ def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
                 label, color, style = SCHEME_STYLE[k]
                 plt.plot(r["rho_edge"], r[f"eta_{k}"], style, color=color, label=label, linewidth=1.6,
                          markersize=6, markerfacecolor="none", markeredgewidth=1.4)
-            plt.xlabel("Eve SNR at disk edge, rho_edge (dB)")
+            plt.xlabel("ρ_e: Eve SNR at disk edge (dB)")
             plt.ylabel("Secrecy Throughput (bps/Hz)")
-            plt.title(f"rho_b = {rb_db} dB, eps = {eps}")
+            plt.title(f"ρ_b = {rb_db} dB, ε = {eps}")
             plt.grid(True, linestyle=":", alpha=0.7)
             if i == 0 and j == 0:
                 plt.legend(fontsize=8)
@@ -584,13 +588,13 @@ def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
         for j, eps in enumerate(eps_list):
             r = res[(rb_db, eps)]
             plt.subplot(nr, nc, i * nc + j + 1)
-            for k in ("genie", "proposed", "noiseless"):
+            for k in ("genie", "proposed", "agnostic"):
                 label, color, style = SCHEME_STYLE[k]
                 plt.plot(r["rho_edge"], r[f"phi_{k}"], style, color=color, label=label, linewidth=1.6,
                          markersize=6, markerfacecolor="none", markeredgewidth=1.4)
-            plt.xlabel("Eve SNR at disk edge, rho_edge (dB)")
+            plt.xlabel("ρ_e: Eve SNR at disk edge (dB)")
             plt.ylabel("Average phi (transmitted blocks)")
-            plt.title(f"rho_b = {rb_db} dB, eps = {eps}")
+            plt.title(f"ρ_b = {rb_db} dB, ε = {eps}")
             plt.ylim(0, 1)
             plt.grid(True, linestyle=":", alpha=0.7)
             if i == 0 and j == 0:
