@@ -11,7 +11,7 @@ from scipy.special import gamma as gamma_fn
 #   - 4장: Alice가 Eve의 순시 CSI를 아는 경우 (Genie-aided, 성능 상한)
 #   - 5장: Eve의 위치가 불확실한 경우. Eve는 Alice 중심 원 안 어딘가에 면적 균일하게 위치 (원 모델)
 # - 비교 (6장)
-#   - Genie: Eve의 순시 CSI(위치 포함)를 알고 블록마다 4장 알고리즘으로 phi 선택 -> 상한 (R_s = Cs, 보안 처리량 = Cs의 평균)
+#   - Genie: Eve의 순시 CSI(위치 포함)를 알고 블록마다 4장 알고리즘으로 phi 선택 -> 상한 (R_s = Cs, 유효 보안 처리량 = Cs의 평균)
 #   - Proposed: 위치·g 평균 SOP p_so <= eps 아래 블록마다 phi, R_s 선택
 #   - Agnostic-phi: phi는 위치 정보 없이(Eve 수신 잡음 0, 가장 가까운 Eve 가정) 정하고 R_s는 위치 분포로 선택 (p_so = eps)
 #                -> Proposed와 phi 선택만 다름 (위치 정보에 맞춘 phi 선택 자체의 가치)
@@ -20,7 +20,7 @@ from scipy.special import gamma as gamma_fn
 #   - Static (표로만 출력): Proposed의 phi를 h와 무관하게 하나로 고정, R_s는 블록마다 (p_so = eps)
 #                -> Proposed와 phi의 블록 적응 여부만 다름
 # - 평가 지표 (논문 표기)
-#   - 보안 처리량 R_s의 평균 (bps/Hz): 블록마다 R_b = Cb(phi), R_s = [f_eps(phi*)]^+,
+#   - 유효 보안 처리량 E[R_s * 1{누설 없음}] (bps/Hz, Yan 외 2015): 블록마다 R_b = Cb(phi), R_s = [f_eps(phi*)]^+,
 #     f_eps(phi) = Cb(phi) - log2(1 + theta_eps(phi)), theta_eps: p_so = eps가 되는 SINR_e 문턱값
 #   - 전송 블록의 실제 누설 비율 (MC, 설계한 p_so 확인용)
 # ====================================
@@ -252,7 +252,7 @@ def verify_ch4_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_po
 # - Eve는 Alice 중심 반지름 r0인 원 안 어딘가에 면적 균일하게 위치, 위치는 전송 동안 고정이며 Alice는 모름
 #   -> Eve의 평균 SNR = rho_edge * (r/r0)^-alpha (코드의 rho_edge = 논문의 rho_e, 원 가장자리 Eve의 평균 SNR)
 # - 블록마다 Alice는 h를 알고 phi, R_b(=Cb), R_s를 정함. 제약: 위치·g 평균 SOP p_so <= eps
-# - 성능: 보안 처리량 (Eve 순시 CSI가 있으면 R_s = Cs이므로 4장 Genie가 상한)
+# - 성능: 유효 보안 처리량 E[R_s * 1{누설 없음}] (Eve 순시 CSI가 있으면 R_s = Cs, 누설 없음 -> 4장 Genie가 상한)
 # - 코드 변수와 논문 표기: tau (L의 인자, tau = theta/(1-phi)), q_* = theta_eps(phi) (SINR_e 문턱값)
 # ====================================
 
@@ -422,7 +422,7 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
                 print(f"{re_db:>12} | {phi:>4.1f} | {p_an:>9.5f} | {p_mc:>9.5f} | {z:>5.2f}")
 
     print(f"\n[5장 해석식 검증 C] 설계한 (phi*, R_b, R_s)에서 전송 블록의 누설 비율 (표본 {num_samples})")
-    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'전송 비율':>9} | {'누설 비율 MC':>11} | {'z':>5} | {'보안 처리량':>10}")
+    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'전송 비율':>9} | {'누설 비율 MC':>11} | {'z':>5} | {'유효 처리량':>10}")
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
     for rb_db in rho_b_db_list:
         rho_b = 10 ** (rb_db / 10)
@@ -434,13 +434,14 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
                 phi_opt, rs = optimize_ch5_disk(A, phi_fine, q_fine)
                 tx = rs > 0
                 q_opt = np.interp(phi_opt, phi_fine, q_fine)          # phi_opt는 격자점 -> 정확히 theta_eps(phi*)
-                leak = (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)[tx]   # Ce > R_b - R_s  <=>  SINR_e > theta_eps(phi*)
+                leak_all = tx & (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)   # Ce > R_b - R_s  <=>  SINR_e > theta_eps(phi*)
+                est = np.mean(rs * ~leak_all)                          # 유효 보안 처리량 (샌 블록은 0)
                 if tx.sum() == 0:                                      # 전송 블록 없음 -> 누설 비율 정의되지 않음
-                    print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {'-':>11} | {'-':>5} | {rs.mean():>10.4f}")
+                    print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {'-':>11} | {'-':>5} | {est:>10.4f}")
                     continue
-                p_leak = leak.mean()
+                p_leak = leak_all[tx].mean()
                 z = abs(p_leak - eps) / np.sqrt(eps * (1 - eps) / tx.sum())
-                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {p_leak:>11.5f} | {z:>5.2f} | {rs.mean():>10.4f}")
+                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {p_leak:>11.5f} | {z:>5.2f} | {est:>10.4f}")
 
     print(f"\n[5장 해석식 검증 D] 블록별 탐색(거친 격자 + 이웃 정밀 격자) vs 정밀 격자 전수 탐색 ({CH5_PHI_FINE_N}점)")
     print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'손실 최대':>10}")
@@ -505,12 +506,13 @@ SCHEME_STYLE = {   # 라벨, 색, 선·마커 (기법별 통일)
 
 def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edge_db_range=RHO_EDGE_DB_RANGE,
                    eps_list=EPS_LIST, seed=SEED, alpha=PL_ALPHA):
-    # 원 모델에서 기법별 보안 처리량, 전송 블록의 평균 phi, 전송 블록의 실제 누설 비율(MC)
+    # 원 모델에서 기법별 유효 보안 처리량, 전송 블록의 평균 phi, 전송 블록의 실제 누설 비율(MC)
+    # 유효 보안 처리량 = E[R_s * 1{누설 없음}] (Yan 외 2015): 샌 블록은 0으로 셈 -> 어떤 eps에서도 Genie(E[Cs])가 상한
     # (rho_b, rho_edge)마다 채널·위치 표본을 한 번 생성해 eps와 모든 기법이 공유
     rng = np.random.default_rng(seed)
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
     q_agnostic = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
-    res = {(rb, eps): {"rho_edge": [], **{f"{m}_{k}": [] for m in ("eta", "phi", "leak") for k in SCHEMES}}
+    res = {(rb, eps): {"rho_edge": [], **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak") for k in SCHEMES}}
            for rb in rho_b_db_list for eps in eps_list}
 
     print(f"시뮬레이션 시작 (Samples: {num_samples}, alpha: {alpha})")
@@ -539,17 +541,19 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
                 r["rho_edge"].append(re_db)
                 for k, (phi_k, rs_k) in out.items():
                     tx = rs_k > 0
-                    r[f"eta_{k}"].append(rs_k.mean())
+                    if k == "genie":
+                        leak = np.zeros(num_samples, dtype=bool)                       # Eve CSI로 R_s = Cs -> 누설 없음
+                    else:
+                        thr = (1 + A * (1 - phi_k)) / 2 ** rs_k - 1                    # 2^(R_b - R_s) - 1
+                        leak = tx & (B * (1 - phi_k) / (1 + D * phi_k) > thr)          # Ce > R_b - R_s
+                    r[f"eta_{k}"].append(np.mean(rs_k * ~leak))                       # 유효 보안 처리량: 샌 블록은 0
+                    r[f"raw_{k}"].append(rs_k.mean())                                  # 샌 블록 포함 (Zhang 외의 정의, 비교용)
                     r[f"phi_{k}"].append(phi_k[tx].mean() if tx.any() else np.nan)
-                    if k == "genie" or not tx.any():
-                        r[f"leak_{k}"].append(0.0 if k == "genie" else np.nan)
-                        continue
-                    thr = (1 + A * (1 - phi_k)) / 2 ** rs_k - 1                        # 2^(R_b - R_s) - 1
-                    r[f"leak_{k}"].append(np.mean((B * (1 - phi_k) / (1 + D * phi_k) > thr)[tx]))
+                    r[f"leak_{k}"].append(leak[tx].mean() if tx.any() else np.nan)
 
     # ----- 결과 표 출력 -----
     for (rb_db, eps), r in res.items():
-        print(f"\n[rho_b = {rb_db} dB, eps = {eps}] 보안 처리량 (bps/Hz), 전송 블록 평균 phi, 전송 블록의 실제 누설 비율")
+        print(f"\n[rho_b = {rb_db} dB, eps = {eps}] 유효 보안 처리량 (bps/Hz), 전송 블록 평균 phi, 전송 블록의 실제 누설 비율")
         print(f"{'rho_edge':>8} | " + " | ".join(f"{k:>13}" for k in SCHEMES)
               + f" | {'phi(P)':>6} | {'phi(A)':>6} | {'누설(P)':>7} | {'누설(A-phi)':>9} | {'누설(A)':>7}")
         for i, re_db in enumerate(r["rho_edge"]):
@@ -558,13 +562,16 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
                   + f" | {r['leak_agnostic_phi'][i]:>9.4f} | {r['leak_agnostic'][i]:>7.4f}")
         gap = 100 * (1 - np.array(r["eta_static"]) / np.array(r["eta_proposed"]))
         print(f"  Static의 Proposed 대비 손실: 최대 {np.nanmax(gap):.2f}% (phi 블록 적응의 이득)")
+        ok = np.array(r["raw_proposed"]) > 1e-3
+        ratio = np.array(r["eta_proposed"])[ok] / np.array(r["raw_proposed"])[ok]
+        print(f"  Proposed의 (유효 / 샌 블록 포함) 비: {ratio.min():.4f} ~ {ratio.max():.4f} (이론값 1 - eps = {1 - eps:.2f})")
     return res
 
 
 def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
     nr, nc = len(rho_b_db_list), len(eps_list)
 
-    # ===== (1) rho_edge에 따른 보안 처리량 =====
+    # ===== (1) rho_edge에 따른 유효 보안 처리량 =====
     plt.figure(figsize=(6.5 * nc, 4.8 * nr))
     for i, rb_db in enumerate(rho_b_db_list):
         for j, eps in enumerate(eps_list):
@@ -575,7 +582,7 @@ def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
                 plt.plot(r["rho_edge"], r[f"eta_{k}"], style, color=color, label=label, linewidth=1.6,
                          markersize=6, markerfacecolor="none", markeredgewidth=1.4)
             plt.xlabel("ρ_e: Eve SNR at disk edge (dB)")
-            plt.ylabel("Secrecy Throughput (bps/Hz)")
+            plt.ylabel("Effective Secrecy Throughput (bps/Hz)")
             plt.title(f"ρ_b = {rb_db} dB, ε = {eps}")
             plt.grid(True, linestyle=":", alpha=0.7)
             if i == 0 and j == 0:
