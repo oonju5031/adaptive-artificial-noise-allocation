@@ -274,14 +274,14 @@ def disk_dL(tau, rho_edge, alpha=PL_ALPHA):
 
 def eve_ccdf_disk(theta, phi, rho_edge, alpha=PL_ALPHA):
     # 위치·g 평균 꼬리확률 P(SINR_e > theta) = L(tau) / (1 + phi tau), tau = theta/(1-phi)  (Nt=2)
-    # 분모(AN 항)는 위치와 무관, 위치 정보는 L에만 들어감
+    # 분모(AN의 방해 항)는 위치와 무관, 위치 정보는 L에만 들어감
     tau = theta / (1 - phi)
     return disk_L(tau, rho_edge, alpha) / (1 + phi * tau)
 
 
 def sop_quantile(phi_grid, eps, L_fun, iters=100):
     # theta_eps(phi): P(SINR_e > theta) = eps가 되는 문턱값, theta_eps = (1-phi) tau
-    # tau는 L(tau) = eps (1 + phi tau)의 유일한 근 (좌변 감소, 우변 증가) -> log tau 이분법 (phi 격자 전체 벡터화)
+    # tau는 L(tau) = eps (1 + phi tau)의 유일한 근 (좌변 감소, 우변 비감소) -> log tau 이분법 (phi 격자 전체 벡터화)
     # L_fun: 위치 평균 항 L(tau) (rho_e의 분포만 바꾸면 그대로 적용)
     phi = np.asarray(phi_grid, dtype=float)
     lo = np.full(phi.shape, -60.0)
@@ -315,15 +315,15 @@ def sop_quantile_noiseless(phi_grid, eps):
 
 def harmonic_mean_disk(rho_edge, alpha=PL_ALPHA):
     # 원 모델에서 Eve 평균 SNR의 조화평균 1/E[1/rho] = (1 + alpha/2) rho_edge (산술평균은 발산)
-    # rho_eff(tau)의 tau -> 0 극한
+    # rho_eq(tau)의 tau -> 0 극한
     return (1 + alpha / 2) * rho_edge
 
 
-def rho_eff_disk(tau, rho_edge, alpha=PL_ALPHA):
-    # 등가 SNR rho_eff(tau) = -tau / ln L(tau): 같은 tau에서 L(tau)와 같은 값을 주는 단일 평균 SNR
-    # 분위수 방정식 L(tau) = eps(1 + phi tau)에서 L(tau) = exp(-tau/rho_eff)로 바꿔도 근이 같음
-    # -> theta_eps(phi)는 평균 SNR이 rho_eff(tau(phi))인 고정 Eve의 문턱값과 정확히 같음
-    # ln L(tau)가 tau에 대해 볼록(누적생성함수) -> rho_eff는 tau에 대해 증가, tau -> 0이면 조화평균, tau -> inf이면 최대값
+def rho_eq_disk(tau, rho_edge, alpha=PL_ALPHA):
+    # 등가 SNR rho_eq(tau) = -tau / ln L(tau): 같은 tau에서 L(tau)와 같은 값을 주는 단일 평균 SNR
+    # 분위수 방정식 L(tau) = eps(1 + phi tau)에서 L(tau) = exp(-tau/rho_eq)로 바꿔도 근이 같음
+    # -> theta_eps(phi)는 평균 SNR이 rho_eq(tau(phi))인 고정 Eve의 문턱값과 정확히 같음
+    # ln L(tau)가 tau에 대해 볼록(누적생성함수) -> rho_eq는 tau에 대해 증가, tau -> 0이면 조화평균, tau -> inf이면 상한 없이 증가
     return -np.asarray(tau, dtype=float) / np.log(disk_L(tau, rho_edge, alpha))
 
 
@@ -474,19 +474,19 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
             rng_txt = "모든 A" if T >= 1 else f"A < {10 * np.log10(T / (1 - T)):.2f} dB"
             print(f"{re_db:>12} | {eps:>5.2f} | {T:>9.3f} | {rng_txt:>16} | {int(np.sum(brute_on != pred_on)):>3}/{len(A_sweep)}")
 
-    print(f"\n[5장 해석식 검증 F] 등가 SNR rho_eff: 분위수 등가성, 단조성, 조화평균 극한")
-    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'theta 등가 최대 상대오차':>18} | {'단조 증가':>8} | {'rho_eff(tau->0)/조화평균':>21}")
+    print(f"\n[5장 해석식 검증 F] 등가 SNR rho_eq: 분위수 등가성, 단조성, 조화평균 극한")
+    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'theta 등가 최대 상대오차':>18} | {'단조 증가':>8} | {'rho_eq(tau->0)/조화평균':>21}")
     tau_scan = np.geomspace(1e-6, 1e6, 200)
     for re_db in rho_edge_db_list:
         re = 10 ** (re_db / 10)
-        r_eff = rho_eff_disk(tau_scan * re, re, alpha)
-        mono = bool(np.all(np.diff(r_eff) > 0))
-        lim = r_eff[0] / harmonic_mean_disk(re, alpha)
+        r_eq = rho_eq_disk(tau_scan * re, re, alpha)
+        mono = bool(np.all(np.diff(r_eq) > 0))
+        lim = r_eq[0] / harmonic_mean_disk(re, alpha)
         for eps in eps_list:
             phis = np.linspace(0.0, 0.95, 20)
             q_disk = sop_quantile_disk(phis, eps, re, alpha)
             tau_phi = q_disk / (1 - phis)
-            q_equiv = np.array([sop_quantile_fixed(np.array([p]), eps, rho_eff_disk(t, re, alpha))[0] for p, t in zip(phis, tau_phi)])
+            q_equiv = np.array([sop_quantile_fixed(np.array([p]), eps, rho_eq_disk(t, re, alpha))[0] for p, t in zip(phis, tau_phi)])
             print(f"{re_db:>12} | {eps:>5.2f} | {np.max(np.abs(q_equiv / q_disk - 1)):>18.1e} | {str(mono):>8} | {lim:>21.6f}")
 
 
