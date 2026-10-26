@@ -267,6 +267,8 @@ def disk_L(tau, rho_edge, alpha=PL_ALPHA):
 
 def disk_dL(tau, rho_edge, alpha=PL_ALPHA):
     # L'(tau) = -(d/rho_edge) x^(-d-1) lower_gamma(d+1, x), x = tau/rho_edge
+    # L'(tau) = (d/tau)(exp(-x) - L(tau))와 같은 식 (본문 식 (5.19)는 여기에 L(tau_eps(0)) = eps를 대입한 형태)
+    # 작은 tau에서 두 값의 차가 상쇄되는 것을 피하려고 감마 함수 형태를 사용
     d = 2.0 / alpha
     x = np.maximum(np.asarray(tau, dtype=float) / rho_edge, 1e-300)
     return -(d / rho_edge) * x ** (-d - 1) * gammainc(d + 1, x) * gamma_fn(d + 1)
