@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import gammainc
 from scipy.special import gamma as gamma_fn
+from scipy.special import ndtr
 
 # ====================================
 # 적응형 AN 전력 할당 시뮬레이션
@@ -257,6 +258,11 @@ def verify_ch4_hybrid(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_po
 # ====================================
 
 
+def norm_sf(x):
+    # 표준정규분포의 꼬리확률 P(Z > x)
+    return ndtr(-x)
+
+
 def disk_L(tau, rho_edge, alpha=PL_ALPHA):
     # 위치 평균 항 L(tau) = E_r[exp(-(tau/rho_e)(r/r0)^alpha)] (거리 r에 대해 평균한 결과)
     # 닫힌형: L(tau) = d (rho_edge/tau)^d * lower_gamma(d, tau/rho_edge), d = 2/alpha (tau -> 0이면 1)
@@ -393,12 +399,17 @@ def optimize_static_ch5(rho_b, phi_fine, q_fine, coarse_step=CH5_COARSE_STEP, n=
     return phi_fine[idx_f[np.argmax(mean_rs(idx_f))]]
 
 
-def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), eps_list=EPS_LIST,
+def verify_ch5_disk(rho_b_db_list=RHO_B_DB_LIST, rho_edge_db_list=(-10, 0, 10), eps_list=EPS_LIST,
                     num_samples=200000, seed=3, alpha=PL_ALPHA):
     # 5장 해석식 검증
     #   A. 위치 평균 항 L(tau): 닫힌형 vs 수치적분 (Gauss-Legendre)
+    #   A2. 이분법으로 구한 tau_eps의 상대 오차 (정밀 격자 전체, 40자리 정밀도 계산 기준, mpmath가 있을 때만, 약 2.5분)
     #   B. 위치·g 평균 Eve SINR 꼬리확률: 해석식 vs MC (실제 h, g, 위치 표본)
     #   C. 설계한 (phi*, R_b, R_s)에서 전송 블록의 실제 누설 비율(MC)이 eps와 같은지
+    #   D. AN 사용 조건 A/(1+A) < T: 닫힌형 판정 vs 정밀 격자 전수 탐색
+    #   E. 등가 SNR rho_eq: 분위수 등가성, 단조성, 조화평균 극한
+    #   F. f_eps(phi)의 단봉성(정밀 격자에서 내부 극대 <= 1, 내부 극소 = 0)과 블록별 탐색(거친 격자 + 이웃 정밀 격자)의 손실 (A 전 구간)
+    #   G. 정밀 격자 간격에 따른 R_s 손실 (4001점 vs 40001점)
     rng = np.random.default_rng(seed)
     glx, glw = np.polynomial.legendre.leggauss(4000)
     u, w = (glx + 1) / 2, glw / 2
@@ -409,6 +420,30 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
         ss = np.geomspace(1e-3, 1e3, 25) * re
         num = np.array([np.sum(w * np.exp(-s * u ** (alpha / 2) / re)) for s in ss])
         print(f"{re_db:>12} | {np.max(np.abs(disk_L(ss, re, alpha) / num - 1)):>12.1e}")
+
+    try:
+        import mpmath as mp
+    except ImportError:
+        mp = None
+    if mp is None:
+        print("\n[5장 해석식 검증 A2] mpmath가 없어 건너뜀")
+    else:
+        mp.mp.dps = 40
+        print(f"\n[5장 해석식 검증 A2] 이분법으로 구한 tau_eps의 상대 오차 (정밀 격자 {CH5_PHI_FINE_N}점 전체, 40자리 정밀도 기준)")
+        print(f"{'eps':>5} | {'최대 상대오차':>12}")
+        d_mp = mp.mpf(2) / mp.mpf(alpha)
+        phi_grid = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
+        for eps in eps_list:
+            worst = 0.0
+            for re_db in RHO_EDGE_DB_RANGE:
+                re = 10 ** (re_db / 10)
+                R = mp.mpf(re)
+                taus = sop_quantile_disk(phi_grid, eps, re, alpha) / (1 - phi_grid)
+                for phi, t in zip(phi_grid, taus):
+                    g = lambda x: d_mp * (R / x) ** d_mp * mp.gammainc(d_mp, 0, x / R) - eps * (1 + phi * x)
+                    t_ref = mp.findroot(g, mp.mpf(t))
+                    worst = max(worst, abs(float(t / t_ref - 1)))
+            print(f"{eps:>5.2f} | {worst:>12.1e}")
 
     print(f"\n[5장 해석식 검증 B] Eve SINR 꼬리확률: 해석식 vs MC (표본 {num_samples})")
     print(f"{'rho_edge(dB)':>12} | {'phi':>4} | {'P 해석':>9} | {'P MC':>9} | {'z':>5}")
@@ -423,49 +458,41 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
                 z = abs(p_an - p_mc) / np.sqrt(p_an * (1 - p_an) / num_samples)
                 print(f"{re_db:>12} | {phi:>4.1f} | {p_an:>9.5f} | {p_mc:>9.5f} | {z:>5.2f}")
 
-    print(f"\n[5장 해석식 검증 C] 설계한 (phi*, R_b, R_s)에서 전송 블록의 누설 비율 (표본 {num_samples})")
-    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'전송 비율':>9} | {'누설 비율 MC':>11} | {'z':>5} | {'유효 처리량':>10}")
+    print(f"\n[5장 해석식 검증 C] 설계한 (phi*, R_b, R_s)에서 전송 블록의 누설 비율 (조합마다 독립 표본 {num_samples})")
+    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'전송 블록 수':>10} | {'누설 비율 MC':>11} | {'z':>6} | {'유효 처리량':>10}")
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
-    for rb_db in rho_b_db_list:
+    z_all, neps_all = [], []
+    for rb_db in rho_b_db_list:                                         # 3.6절 설정 (rho_b, rho_e 전 구간)
         rho_b = 10 ** (rb_db / 10)
-        for re_db in rho_edge_db_list:
+        for re_db in RHO_EDGE_DB_RANGE:
             re = 10 ** (re_db / 10)
-            A, B, D, _ = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
             for eps in eps_list:
+                A, B, D, _ = generate_gains_disk(rng, num_samples, rho_b, re, alpha)   # 조합마다 새 표본 -> 조합 간 z 독립
                 q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
                 phi_opt, rs = optimize_ch5_disk(A, phi_fine, q_fine)
                 tx = rs > 0
                 q_opt = np.interp(phi_opt, phi_fine, q_fine)          # phi_opt는 격자점 -> 정확히 theta_eps(phi*)
                 leak_all = tx & (B * (1 - phi_opt) / (1 + D * phi_opt) > q_opt)   # Ce > R_b - R_s  <=>  SINR_e > theta_eps(phi*)
                 est = np.mean(rs * ~leak_all)                          # 유효 보안 처리량 (샌 블록은 0)
-                if tx.sum() == 0:                                      # 전송 블록 없음 -> 누설 비율 정의되지 않음
-                    print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {'-':>11} | {'-':>5} | {est:>10.4f}")
+                n_tx = int(tx.sum())
+                if n_tx == 0:                                          # 전송 블록 없음 -> 누설 비율 정의되지 않음
+                    print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {n_tx:>10} | {'-':>11} | {'-':>6} | {est:>10.4f}")
                     continue
                 p_leak = leak_all[tx].mean()
-                z = abs(p_leak - eps) / np.sqrt(eps * (1 - eps) / tx.sum())
-                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {tx.mean():>9.3f} | {p_leak:>11.5f} | {z:>5.2f} | {est:>10.4f}")
+                z = (p_leak - eps) / np.sqrt(eps * (1 - eps) / n_tx)  # 부호 있는 z (본문 정의와 같음)
+                z_all.append(z)
+                neps_all.append(n_tx * eps)
+                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {n_tx:>10} | {p_leak:>11.5f} | {z:>6.2f} | {est:>10.4f}")
+    z_max = np.max(np.abs(z_all))
+    p_one = 2 * norm_sf(z_max)
+    print(f"  |z| 최댓값 {z_max:.2f}, 독립인 {len(z_all)}개 조합에서 표본 오차만으로 이 값 이상이 나올 확률 {1 - (1 - p_one) ** len(z_all):.3f}, "
+          f"최소 기대 누설 블록 수(n*eps) {min(neps_all):.1f}")
 
-    print(f"\n[5장 해석식 검증 D] 블록별 탐색(거친 격자 + 이웃 정밀 격자) vs 정밀 격자 전수 탐색 ({CH5_PHI_FINE_N}점)")
-    print(f"{'rho_b(dB)':>9} | {'rho_edge(dB)':>12} | {'eps':>5} | {'손실 최대':>10}")
-    n_d = 20000
-    for rb_db in rho_b_db_list:
-        rho_b = 10 ** (rb_db / 10)
-        A = rho_b * rng.gamma(NT, 1.0, size=n_d)                       # ||h||^2 ~ Gamma(Nt, 1)
-        for re_db in rho_edge_db_list:
-            re = 10 ** (re_db / 10)
-            for eps in eps_list:
-                q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
-                _, rs = optimize_ch5_disk(A, phi_fine, q_fine)
-                full = np.empty(n_d)
-                for s0 in range(0, n_d, 2000):                         # 메모리 절약용 청크
-                    a = A[s0:s0 + 2000, None]
-                    full[s0:s0 + 2000] = np.maximum(0.0, (np.log2(1 + a * (1 - phi_fine[None, :])) - np.log2(1 + q_fine)[None, :]).max(1))
-                print(f"{rb_db:>9} | {re_db:>12} | {eps:>5.2f} | {(full - rs).max():>10.1e}")
-
-    print(f"\n[5장 해석식 검증 E] AN 사용 조건 A/(1+A) < T: 닫힌형 판정 vs 정밀 격자 전수 탐색 (A = -10 ~ 40 dB, 0.5 dB 간격)")
-    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'T':>9} | {'AN 사용 A 구간':>16} | {'불일치':>6}")
-    A_sweep = 10 ** (np.arange(-10, 40.01, 0.5) / 10)
-    for re_db in (-20, -15) + tuple(rho_edge_db_list):
+    A_wide = 10 ** (np.arange(-20, 50.001, 0.05) / 10)                # D, F, G 공통 A 범위: -20 ~ 50 dB, 0.05 dB 간격
+    print(f"\n[5장 해석식 검증 D] AN 사용 조건 A/(1+A) < T: 닫힌형 판정 vs 정밀 격자 전수 탐색 (A = -20 ~ 50 dB, 0.05 dB 간격)")
+    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'T':>9} | {'AN 사용 A 구간':>16} | {'불일치':>9}")
+    A_sweep = A_wide
+    for re_db in RHO_EDGE_DB_RANGE:
         re = 10 ** (re_db / 10)
         for eps in eps_list:
             T = an_on_threshold_disk(eps, re, alpha)
@@ -476,7 +503,7 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
             rng_txt = "모든 A" if T >= 1 else f"A < {10 * np.log10(T / (1 - T)):.2f} dB"
             print(f"{re_db:>12} | {eps:>5.2f} | {T:>9.3f} | {rng_txt:>16} | {int(np.sum(brute_on != pred_on)):>3}/{len(A_sweep)}")
 
-    print(f"\n[5장 해석식 검증 F] 등가 SNR rho_eq: 분위수 등가성, 단조성, 조화평균 극한")
+    print(f"\n[5장 해석식 검증 E] 등가 SNR rho_eq: 분위수 등가성, 단조성, 조화평균 극한")
     print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'theta 등가 최대 상대오차':>18} | {'단조 증가':>8} | {'rho_eq(tau->0)/조화평균':>21}")
     tau_scan = np.geomspace(1e-6, 1e6, 200)
     for re_db in rho_edge_db_list:
@@ -490,6 +517,42 @@ def verify_ch5_disk(rho_b_db_list=(0, 10, 20), rho_edge_db_list=(-10, 0, 10), ep
             tau_phi = q_disk / (1 - phis)
             q_equiv = np.array([sop_quantile_fixed(np.array([p]), eps, rho_eq_disk(t, re, alpha))[0] for p, t in zip(phis, tau_phi)])
             print(f"{re_db:>12} | {eps:>5.2f} | {np.max(np.abs(q_equiv / q_disk - 1)):>18.1e} | {str(mono):>8} | {lim:>21.6f}")
+
+    print(f"\n[5장 해석식 검증 F] f_eps(phi)의 단봉성과 블록별 탐색의 손실 (A = -20 ~ 50 dB, 0.05 dB 간격, {len(A_wide)}개)")
+    print(f"{'rho_edge(dB)':>12} | {'eps':>5} | {'내부 극대 최대':>12} | {'내부 극소 최대':>12} | {'손실 최대':>10}")
+    for re_db in RHO_EDGE_DB_RANGE:
+        re = 10 ** (re_db / 10)
+        for eps in eps_list:
+            q_fine = sop_quantile_disk(phi_fine, eps, re, alpha)
+            R = np.log2(1 + A_wide[:, None] * (1 - phi_fine[None, :])) - np.log2(1 + q_fine)[None, :]
+            n_max = np.zeros(len(A_wide), int)
+            n_min = np.zeros(len(A_wide), int)
+            for i, s in enumerate(np.sign(np.diff(R, axis=1))):
+                s = s[s != 0]
+                ch = np.diff(s)
+                n_max[i] = np.sum(ch < 0)                                   # 증가 -> 감소: 내부 극대
+                n_min[i] = np.sum(ch > 0)                                   # 감소 -> 증가: 내부 극소
+            _, rs = optimize_ch5_disk(A_wide, phi_fine, q_fine)
+            loss = (np.maximum(0.0, R.max(1)) - rs).max()
+            print(f"{re_db:>12} | {eps:>5.2f} | {n_max.max():>12} | {n_min.max():>12} | {loss:>10.1e}")
+
+    ref_n = 10 * (CH5_PHI_FINE_N - 1) + 1                              # 10배 조밀한 기준 격자
+    phi_ref = np.linspace(0.0, PHI_MAX, ref_n)
+    A_h = A_wide                                                       # F와 같은 A 범위 (-20 ~ 50 dB, 0.05 dB 간격)
+    print(f"\n[5장 해석식 검증 G] 정밀 격자 간격에 따른 R_s 손실 ({CH5_PHI_FINE_N}점 vs {ref_n}점, A = -20 ~ 50 dB, 0.05 dB 간격)")
+    print(f"{'eps':>5} | {'손실 최대':>10}")
+    for eps in eps_list:
+        worst = 0.0
+        for re_db in RHO_EDGE_DB_RANGE:
+            re = 10 ** (re_db / 10)
+            _, rs = optimize_ch5_disk(A_h, phi_fine, sop_quantile_disk(phi_fine, eps, re, alpha))
+            lq_ref = np.log2(1 + sop_quantile_disk(phi_ref, eps, re, alpha))
+            best = np.empty(len(A_h))
+            for s0 in range(0, len(A_h), 50):                              # 메모리 절약용 청크
+                a = A_h[s0:s0 + 50, None]
+                best[s0:s0 + 50] = np.maximum(0.0, (np.log2(1 + a * (1 - phi_ref[None, :])) - lq_ref[None, :]).max(1))
+            worst = max(worst, (best - rs).max())
+        print(f"{eps:>5.2f} | {worst:>10.1e}")
 
 
 # ====================================
