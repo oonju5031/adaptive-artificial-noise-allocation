@@ -509,7 +509,7 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
     q_agnostic = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
     res = {(rb, eps): {"rho_edge": [], "sopavg_edge": [],
-                       **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak", "sopr", "sopavg") for k in SCHEMES}}
+                       **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "phiq", "leak", "sopr", "sopavg") for k in SCHEMES}}
            for rb in rho_b_db_list for eps in eps_list}
 
     print(f"시뮬레이션 시작 (Samples: {num_samples}, alpha: {alpha})")
@@ -546,6 +546,7 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
                     r[f"eta_{k}"].append(np.mean(rs_k * ~leak))                       # 유효 보안 처리량: 샌 블록은 0
                     r[f"raw_{k}"].append(rs_k.mean())                                  # 샌 블록 포함 (Zhang 외의 정의, 비교용)
                     r[f"phi_{k}"].append(phi_k[tx].mean() if tx.any() else np.nan)
+                    r[f"phiq_{k}"].append(np.percentile(phi_k[tx], (10, 90)) if tx.any() else np.full(2, np.nan))   # 블록 간 phi 분포 (10%, 90% 분위수)
                     r[f"leak_{k}"].append(leak[tx].mean() if tx.any() else np.nan)
                     if k != "genie":                                                   # Genie는 누설 없음
                         r[f"sopr_{k}"].append(sop_at_distance(A, phi_k, rs_k, re, DIST_POINTS, alpha))   # 거리별 SOP (머무르는 Eve)
@@ -588,10 +589,11 @@ FIG_STYLE = {"mathtext.fontset": "stix",           # 수식 기호 서체 (rho, 
              "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8}
 
 
-def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None), sharey="row"):
+def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None), sharey="row", band=None):
     # (rho_b, eps) 조합별 작은 그림 (a), (b), ...: 행 = rho_b, 열 = eps, 가로축 rho_e
     # - 가로축은 모든 작은 그림이 공유, 세로축은 sharey에 따라 공유 ("row": 같은 rho_b끼리)
     # - 축 이름과 범례는 그림 전체에 하나씩, 눈금 숫자는 모든 작은 그림에 표시
+    # - band: 지정한 기법의 블록 간 분포(10%~90% 분위수, res의 "phiq_기법")를 음영으로 표시
     nr, nc = len(rho_b_db_list), len(eps_list)
     fig, axs = plt.subplots(nr, nc, figsize=(FIG_SIZE_CM[0] / 2.54, FIG_SIZE_CM[1] / 2.54),
                             sharex=True, sharey=sharey, squeeze=False)
@@ -602,6 +604,10 @@ def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None
                 label, color, style = SCHEME_STYLE[k]
                 ax.plot(r["rho_edge"], r[f"{key}_{k}"], style, color=color, label=label, linewidth=1.0,
                         markersize=3.5, markerfacecolor="none", markeredgewidth=0.9)
+            if band is not None:
+                q = np.array(r[f"phiq_{band}"])
+                ax.fill_between(r["rho_edge"], q[:, 0], q[:, 1], color=SCHEME_STYLE[band][1], alpha=0.18, linewidth=0,
+                                label=f"{SCHEME_STYLE[band][0]} (10–90%)")
             ax.set_title(f"({'abcdefgh'[i * nc + j]}) $\\rho_b$ = {rb_db} dB, $\\varepsilon$ = {eps}")
             ax.set_xticks(np.arange(-20, 21, 10))
             ax.tick_params(labelbottom=True, labelleft=True)                 # 공유 축이어도 눈금 숫자는 모두 표시
@@ -615,7 +621,7 @@ def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None
             lo, hi = ax.get_ylim()
             ax.set_ylim(lo - 0.03 * (hi - lo), hi)                          # 0 근처 곡선이 가로축 선에 묻히지 않도록
     handles, labels = axs[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(schemes), frameon=False)
+    fig.legend(handles, labels, loc="upper center", ncol=len(handles), frameon=False)
     fig.supxlabel(RHO_E_LABEL, fontsize=FIG_STYLE["axes.labelsize"])
     fig.supylabel(ylabel, fontsize=FIG_STYLE["axes.labelsize"])
     fig.tight_layout(rect=(0, 0, 1, 0.95))                                  # 위쪽은 범례 자리
@@ -629,9 +635,9 @@ def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST, save=True)
     fig_est = _plot_grid(res, "eta", PLOT_SCHEMES, "Effective Secrecy Throughput, $\\overline{R}_s$ (bps/Hz)",
                          rho_b_db_list, eps_list)
 
-    # ===== (2) rho_edge에 따른 평균 phi (전송 블록 기준) =====
-    fig_phi = _plot_grid(res, "phi", ("genie", "proposed", "agnostic"), "Average $\\phi$ (transmitted blocks)",
-                         rho_b_db_list, eps_list, ylim=(0, 1), sharey=True)
+    # ===== (2) rho_edge에 따른 전송 블록의 평균 phi (그림 6.2): Agnostic-phi는 Agnostic과 같은 phi, Static은 Proposed 평균과 거의 같아 제외 =====
+    fig_phi = _plot_grid(res, "phi", ("genie", "proposed", "agnostic"), "Power allocation ratio, $\\phi$",
+                         rho_b_db_list, eps_list, ylim=(0, 1), sharey=True, band="proposed")
     if save:
         for fig, name in zip((fig_est, fig_phi), FIG_FILES):
             fig.savefig(name, dpi=FIG_DPI)
