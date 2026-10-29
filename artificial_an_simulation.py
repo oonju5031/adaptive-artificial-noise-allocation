@@ -48,7 +48,7 @@ CH5_COARSE_STEP = 20    # 블록별 탐색의 거친 격자 간격 (정밀 격�
 # 6장 시뮬레이션 구간
 RHO_B_DB_LIST = (10, 20)                    # Bob 송신 SNR rho_b (dB)
 RHO_EDGE_DB_RANGE = np.arange(-20, 21, 5)   # 원 가장자리(가장 약한 위치) Eve의 평균 SNR rho_edge (dB), 논문의 rho_e
-DIST_BINS = (0.0, 0.25, 0.5, 0.75, 1.0)     # 위치별 누설 비율을 집계할 Eve 거리 구간 (r / r0)
+DIST_POINTS = (0.1, 0.25, 0.5, 0.75, 1.0)   # 위치별 SOP를 계산할 Eve 거리 (r / r0, Eve가 그 위치에 머무르는 경우)
 # ------------------------------------
 
 
@@ -188,6 +188,26 @@ def disk_dL(tau, rho_edge, alpha=PL_ALPHA):
     d = 2.0 / alpha
     x = np.maximum(np.asarray(tau, dtype=float) / rho_edge, 1e-300)
     return -(d / rho_edge) * x ** (-d - 1) * gammainc(d + 1, x) * gamma_fn(d + 1)
+
+
+def sop_at_distance(A, phi, rs, rho_edge, dist, alpha=PL_ALPHA):
+    # 블록마다 정한 (phi, R_s)에서 거리 r/r0 = dist에 머무르는 Eve의 SOP를 전송 블록에 대해 평균 (그 Eve가 오래 겪는 누설 비율)
+    #   식 (5.11): SOP = exp(-tau / rho_f) / (1 + phi tau), rho_f = rho_edge (r/r0)^(-alpha), tau = theta / (1 - phi)
+    #   theta = 2^(R_b - R_s) - 1, R_b = Cb(phi)
+    tx = rs > 0
+    if not tx.any():
+        return np.full(len(dist), np.nan)
+    tau = ((1 + A[tx] * (1 - phi[tx])) / 2 ** rs[tx] - 1) / (1 - phi[tx])
+    return np.array([np.mean(np.exp(-tau * x ** alpha / rho_edge) / (1 + phi[tx] * tau)) for x in dist])
+
+
+def sop_avg_disk(A, phi, rs, rho_edge, alpha=PL_ALPHA):
+    # 위치에 대해 평균한 SOP L(tau) / (1 + phi tau)를 전송 블록에 대해 평균 (식 (5.8))
+    tx = rs > 0
+    if not tx.any():
+        return np.nan
+    tau = ((1 + A[tx] * (1 - phi[tx])) / 2 ** rs[tx] - 1) / (1 - phi[tx])
+    return np.mean(disk_L(tau, rho_edge, alpha) / (1 + phi[tx] * tau))
 
 
 def eve_ccdf_disk(theta, phi, rho_edge, alpha=PL_ALPHA):
@@ -488,8 +508,8 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     rng = np.random.default_rng(seed)
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
     q_agnostic = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
-    res = {(rb, eps): {"rho_edge": [], "leak_edge": [],
-                       **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak", "leakbin") for k in SCHEMES}}
+    res = {(rb, eps): {"rho_edge": [], "sopavg_edge": [],
+                       **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak", "sopr", "sopavg") for k in SCHEMES}}
            for rb in rho_b_db_list for eps in eps_list}
 
     print(f"시뮬레이션 시작 (Samples: {num_samples}, alpha: {alpha})")
@@ -497,9 +517,7 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
         rho_b = 10 ** (rb_db / 10)
         for re_db in rho_edge_db_range:
             re = 10 ** (re_db / 10)
-            A, B, D, rho_e_s = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
-            dist = (rho_e_s / re) ** (-1 / alpha)                                     # Eve 거리 r / r0 (위치별 누설 비율 집계용)
-            dbin = np.digitize(dist, DIST_BINS[1:-1])                                  # 거리 구간 번호 0 ~ len(DIST_BINS) - 2
+            A, B, D, _ = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
 
             # Genie: Eve 순시 CSI(위치 포함)로 블록마다 4장 알고리즘 -> R_s = [Cb - Ce]^+ (eps와 무관, 누설 없음)
             phi_g = optimize_genie_closed(A, B, D)
@@ -529,14 +547,13 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
                     r[f"raw_{k}"].append(rs_k.mean())                                  # 샌 블록 포함 (Zhang 외의 정의, 비교용)
                     r[f"phi_{k}"].append(phi_k[tx].mean() if tx.any() else np.nan)
                     r[f"leak_{k}"].append(leak[tx].mean() if tx.any() else np.nan)
-                    r[f"leakbin_{k}"].append(np.array([leak[tx & (dbin == b)].mean() if (tx & (dbin == b)).any() else np.nan
-                                                       for b in range(len(DIST_BINS) - 1)]))   # 거리 구간별 전송 블록의 누설 비율
+                    if k != "genie":                                                   # Genie는 누설 없음
+                        r[f"sopr_{k}"].append(sop_at_distance(A, phi_k, rs_k, re, DIST_POINTS, alpha))   # 거리별 SOP (머무르는 Eve)
+                        r[f"sopavg_{k}"].append(sop_avg_disk(A, phi_k, rs_k, re, alpha))                 # 위치 평균 SOP (검산)
 
-                # 가장자리 Eve 가정 설계 (비교 기법 아님): 위치 불확실성을 무시하고 Eve가 r = r0에 있다고 보고 설계했을 때의 실제 누설 비율
+                # 가장자리 Eve 가정 설계 (비교 기법 아님): 위치 불확실성을 무시하고 Eve가 r = r0에 있다고 보고 설계했을 때의 위치 평균 SOP
                 phi_f, rs_f = optimize_ch5_disk(A, phi_fine, sop_quantile_fixed(phi_fine, eps, re))
-                tx_f = rs_f > 0
-                leak_f = tx_f & (B * (1 - phi_f) / (1 + D * phi_f) > (1 + A * (1 - phi_f)) / 2 ** rs_f - 1)
-                r["leak_edge"].append(leak_f[tx_f].mean() if tx_f.any() else np.nan)
+                r["sopavg_edge"].append(sop_avg_disk(A, phi_f, rs_f, re, alpha))
 
     # ----- 결과 표 출력 -----
     for (rb_db, eps), r in res.items():
@@ -552,13 +569,14 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
         ok = np.array(r["raw_proposed"]) > 1e-3
         ratio = np.array(r["eta_proposed"])[ok] / np.array(r["raw_proposed"])[ok]
         print(f"  Proposed의 (유효 / 샌 블록 포함) 비: {ratio.min():.4f} ~ {ratio.max():.4f} (이론값 1 - eps = {1 - eps:.2f})")
-        bins = [f"{DIST_BINS[b]:.2f}~{DIST_BINS[b + 1]:.2f}" for b in range(len(DIST_BINS) - 1)]
-        print(f"  Eve 거리(r/r0) 구간별 전송 블록의 누설 비율, 가장자리 Eve 가정 설계의 누설 비율")
-        print(f"  {'rho_edge':>8} | {'기법':>8} | " + " | ".join(f"{b:>9}" for b in bins) + f" | {'전체':>7} | {'가장자리 가정':>9}")
+        fmt = lambda v, w: f"{'-':>{w}}" if np.isnan(v) else f"{v:>{w}.3g}"                    # 전송 블록이 없으면 '-'
+        print(f"  Eve가 거리 r/r0에 머무를 때의 SOP (식 (5.11), 전송 블록 평균), 위치 평균 SOP, 가장자리 Eve 가정 설계의 위치 평균 SOP")
+        print(f"  {'rho_edge':>8} | {'기법':>8} | " + " | ".join(f"{'r/r0=' + str(x):>9}" for x in DIST_POINTS)
+              + f" | {'위치 평균':>9} | {'가장자리 가정':>9}")
         for i, re_db in enumerate(r["rho_edge"]):
             for k in ("proposed", "agnostic"):
-                print(f"  {re_db:>8} | {k:>8} | " + " | ".join(f"{v:>9.4f}" for v in r[f"leakbin_{k}"][i])
-                      + f" | {r[f'leak_{k}'][i]:>7.4f} | " + (f"{r['leak_edge'][i]:>9.4f}" if k == "proposed" else ""))
+                print(f"  {re_db:>8} | {k:>8} | " + " | ".join(fmt(v, 9) for v in r[f"sopr_{k}"][i])
+                      + f" | {fmt(r[f'sopavg_{k}'][i], 9)} | " + (fmt(r["sopavg_edge"][i], 9) if k == "proposed" else ""))
     return res
 
 
