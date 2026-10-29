@@ -48,6 +48,7 @@ CH5_COARSE_STEP = 20    # 블록별 탐색의 거친 격자 간격 (정밀 격�
 # 6장 시뮬레이션 구간
 RHO_B_DB_LIST = (10, 20)                    # Bob 송신 SNR rho_b (dB)
 RHO_EDGE_DB_RANGE = np.arange(-20, 21, 5)   # 원 가장자리(가장 약한 위치) Eve의 평균 SNR rho_edge (dB), 논문의 rho_e
+DIST_BINS = (0.0, 0.25, 0.5, 0.75, 1.0)     # 위치별 누설 비율을 집계할 Eve 거리 구간 (r / r0)
 # ------------------------------------
 
 
@@ -158,7 +159,8 @@ def verify_ch4_closed(snr_db_list=tuple(SNR_DB_RANGE), num_samples=20000, ref_po
 
 # ====================================
 # 5장: Eve 위치 불확실성 (원 모델)
-# - Eve는 Alice 중심 반지름 r0인 원 안 어딘가에 면적 균일하게 위치, 위치는 전송 동안 고정이며 Alice는 모름
+# - Eve는 Alice 중심 반지름 r0인 원 안 어딘가에 면적 균일하게 위치, 위치는 한 블록 동안 고정이며 Alice는 모름
+#   (시뮬레이션은 위치에 대한 기댓값을 구하기 위해 블록마다 위치를 독립적으로 생성)
 #   -> Eve의 평균 SNR = rho_edge * (r/r0)^-alpha (코드의 rho_edge = 논문의 rho_e, 원 가장자리 Eve의 평균 SNR)
 # - 블록마다 Alice는 h를 알고 phi, R_b(=Cb), R_s를 정함. 제약: 위치·g 평균 SOP p_so <= eps
 # - 성능: 유효 보안 처리량 E[R_s * 1{누설 없음}] (Eve 순시 CSI가 있으면 R_s = Cs, 누설 없음 -> 4장 Genie가 상한)
@@ -486,7 +488,8 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     rng = np.random.default_rng(seed)
     phi_fine = np.linspace(0.0, PHI_MAX, CH5_PHI_FINE_N)
     q_agnostic = {eps: sop_quantile_noiseless(phi_fine, eps) for eps in eps_list}  # rho_edge와 무관
-    res = {(rb, eps): {"rho_edge": [], **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak") for k in SCHEMES}}
+    res = {(rb, eps): {"rho_edge": [], "leak_edge": [],
+                       **{f"{m}_{k}": [] for m in ("eta", "raw", "phi", "leak", "leakbin") for k in SCHEMES}}
            for rb in rho_b_db_list for eps in eps_list}
 
     print(f"시뮬레이션 시작 (Samples: {num_samples}, alpha: {alpha})")
@@ -494,7 +497,9 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
         rho_b = 10 ** (rb_db / 10)
         for re_db in rho_edge_db_range:
             re = 10 ** (re_db / 10)
-            A, B, D, _ = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
+            A, B, D, rho_e_s = generate_gains_disk(rng, num_samples, rho_b, re, alpha)
+            dist = (rho_e_s / re) ** (-1 / alpha)                                     # Eve 거리 r / r0 (위치별 누설 비율 집계용)
+            dbin = np.digitize(dist, DIST_BINS[1:-1])                                  # 거리 구간 번호 0 ~ len(DIST_BINS) - 2
 
             # Genie: Eve 순시 CSI(위치 포함)로 블록마다 4장 알고리즘 -> R_s = [Cb - Ce]^+ (eps와 무관, 누설 없음)
             phi_g = optimize_genie_closed(A, B, D)
@@ -524,6 +529,14 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
                     r[f"raw_{k}"].append(rs_k.mean())                                  # 샌 블록 포함 (Zhang 외의 정의, 비교용)
                     r[f"phi_{k}"].append(phi_k[tx].mean() if tx.any() else np.nan)
                     r[f"leak_{k}"].append(leak[tx].mean() if tx.any() else np.nan)
+                    r[f"leakbin_{k}"].append(np.array([leak[tx & (dbin == b)].mean() if (tx & (dbin == b)).any() else np.nan
+                                                       for b in range(len(DIST_BINS) - 1)]))   # 거리 구간별 전송 블록의 누설 비율
+
+                # 가장자리 Eve 가정 설계 (비교 기법 아님): 위치 불확실성을 무시하고 Eve가 r = r0에 있다고 보고 설계했을 때의 실제 누설 비율
+                phi_f, rs_f = optimize_ch5_disk(A, phi_fine, sop_quantile_fixed(phi_fine, eps, re))
+                tx_f = rs_f > 0
+                leak_f = tx_f & (B * (1 - phi_f) / (1 + D * phi_f) > (1 + A * (1 - phi_f)) / 2 ** rs_f - 1)
+                r["leak_edge"].append(leak_f[tx_f].mean() if tx_f.any() else np.nan)
 
     # ----- 결과 표 출력 -----
     for (rb_db, eps), r in res.items():
@@ -539,6 +552,13 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
         ok = np.array(r["raw_proposed"]) > 1e-3
         ratio = np.array(r["eta_proposed"])[ok] / np.array(r["raw_proposed"])[ok]
         print(f"  Proposed의 (유효 / 샌 블록 포함) 비: {ratio.min():.4f} ~ {ratio.max():.4f} (이론값 1 - eps = {1 - eps:.2f})")
+        bins = [f"{DIST_BINS[b]:.2f}~{DIST_BINS[b + 1]:.2f}" for b in range(len(DIST_BINS) - 1)]
+        print(f"  Eve 거리(r/r0) 구간별 전송 블록의 누설 비율, 가장자리 Eve 가정 설계의 누설 비율")
+        print(f"  {'rho_edge':>8} | {'기법':>8} | " + " | ".join(f"{b:>9}" for b in bins) + f" | {'전체':>7} | {'가장자리 가정':>9}")
+        for i, re_db in enumerate(r["rho_edge"]):
+            for k in ("proposed", "agnostic"):
+                print(f"  {re_db:>8} | {k:>8} | " + " | ".join(f"{v:>9.4f}" for v in r[f"leakbin_{k}"][i])
+                      + f" | {r[f'leak_{k}'][i]:>7.4f} | " + (f"{r['leak_edge'][i]:>9.4f}" if k == "proposed" else ""))
     return res
 
 
