@@ -468,13 +468,14 @@ def verify_ch5_disk(rho_b_db_list=RHO_B_DB_LIST, rho_edge_db_list=(-10, 0, 10), 
 # ====================================
 SCHEMES = ("genie", "proposed", "agnostic_phi", "agnostic", "static")
 PLOT_SCHEMES = ("genie", "proposed", "agnostic_phi", "agnostic")     # Static은 Proposed와 겹쳐 표로만 출력
-SCHEME_STYLE = {   # 라벨, 색, 선·마커 (기법별 통일)
+SCHEME_STYLE = {   # 라벨, 색, 마커·선 (기법별 통일, 흑백 인쇄에서도 구분되도록 그림에 쓰는 기법끼리 선 모양이 겹치지 않게 지정)
     "genie":         ("Genie", "#10b981", "^-."),
     "proposed":      ("Proposed", "#3b82f6", "s-"),
-    "agnostic_phi": ("Agnostic-φ", "#f59e0b", "o--"),
-    "agnostic":     ("Agnostic", "#ef4444", "v--"),
-    "static":        ("Static (fixed phi)", "#8b5cf6", "x:"),
+    "agnostic_phi": ("Agnostic-$\\phi$", "#f59e0b", "o--"),
+    "agnostic":     ("Agnostic", "#ef4444", "v:"),
+    "static":        ("Static", "#8b5cf6", "x-"),   # 그림에는 쓰지 않음 (Proposed와 겹침)
 }
+RHO_E_LABEL = "Average SNR of Eve at disk edge, $\\rho_e$ (dB)"
 
 
 def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edge_db_range=RHO_EDGE_DB_RANGE,
@@ -541,45 +542,40 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     return res
 
 
-def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
+def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None)):
+    # (rho_b, eps) 조합별 작은 그림 (a), (b), ...: 가로축 rho_e, 범례는 그림 위에 한 줄 (모든 작은 그림에 공통)
     nr, nc = len(rho_b_db_list), len(eps_list)
-
-    # ===== (1) rho_edge에 따른 유효 보안 처리량 =====
-    plt.figure(figsize=(6.5 * nc, 4.8 * nr))
+    fig, axs = plt.subplots(nr, nc, figsize=(6.5 * nc, 4.8 * nr), squeeze=False)
     for i, rb_db in enumerate(rho_b_db_list):
         for j, eps in enumerate(eps_list):
-            r = res[(rb_db, eps)]
-            plt.subplot(nr, nc, i * nc + j + 1)
-            for k in PLOT_SCHEMES:
+            ax, r = axs[i, j], res[(rb_db, eps)]
+            for k in schemes:
                 label, color, style = SCHEME_STYLE[k]
-                plt.plot(r["rho_edge"], r[f"eta_{k}"], style, color=color, label=label, linewidth=1.6,
-                         markersize=6, markerfacecolor="none", markeredgewidth=1.4)
-            plt.xlabel("ρ_e: Eve SNR at disk edge (dB)")
-            plt.ylabel("Effective Secrecy Throughput (bps/Hz)")
-            plt.title(f"ρ_b = {rb_db} dB, ε = {eps}")
-            plt.grid(True, linestyle=":", alpha=0.7)
-            if i == 0 and j == 0:
-                plt.legend(fontsize=8)
-    plt.tight_layout()
+                ax.plot(r["rho_edge"], r[f"{key}_{k}"], style, color=color, label=label, linewidth=1.6,
+                        markersize=6, markerfacecolor="none", markeredgewidth=1.4)
+            ax.set_title(f"({'abcdefgh'[i * nc + j]}) $\\rho_b$ = {rb_db} dB, $\\varepsilon$ = {eps}")
+            ax.set_xlabel(RHO_E_LABEL)
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(*ylim)                                              # 세로축 0에서 시작 (비율이 그대로 읽히도록)
+            lo, hi = ax.get_ylim()
+            ax.set_ylim(lo - 0.03 * (hi - lo), hi)                          # 0 근처 곡선이 가로축 선에 묻히지 않도록 아래쪽 여백 3%
+            ax.grid(True, linestyle=":", alpha=0.7)
+    handles, labels = axs[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(schemes), frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))                                  # 위쪽은 범례 자리
+    return fig
+
+
+def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
+    plt.rcParams["mathtext.fontset"] = "stix"                               # 수식 기호 서체 (rho, phi, epsilon 등)
+
+    # ===== (1) rho_edge에 따른 유효 보안 처리량 (그림 6.1) =====
+    _plot_grid(res, "eta", PLOT_SCHEMES, "Effective Secrecy Throughput, $\\overline{R}_s$ (bps/Hz)",
+               rho_b_db_list, eps_list)
 
     # ===== (2) rho_edge에 따른 평균 phi (전송 블록 기준) =====
-    plt.figure(figsize=(6.5 * nc, 4.8 * nr))
-    for i, rb_db in enumerate(rho_b_db_list):
-        for j, eps in enumerate(eps_list):
-            r = res[(rb_db, eps)]
-            plt.subplot(nr, nc, i * nc + j + 1)
-            for k in ("genie", "proposed", "agnostic"):
-                label, color, style = SCHEME_STYLE[k]
-                plt.plot(r["rho_edge"], r[f"phi_{k}"], style, color=color, label=label, linewidth=1.6,
-                         markersize=6, markerfacecolor="none", markeredgewidth=1.4)
-            plt.xlabel("ρ_e: Eve SNR at disk edge (dB)")
-            plt.ylabel("Average phi (transmitted blocks)")
-            plt.title(f"ρ_b = {rb_db} dB, ε = {eps}")
-            plt.ylim(0, 1)
-            plt.grid(True, linestyle=":", alpha=0.7)
-            if i == 0 and j == 0:
-                plt.legend(fontsize=8)
-    plt.tight_layout()
+    _plot_grid(res, "phi", ("genie", "proposed", "agnostic"), "Average $\\phi$ (transmitted blocks)",
+               rho_b_db_list, eps_list, ylim=(0, 1))
     plt.show()
 
 
