@@ -580,40 +580,61 @@ def run_simulation(num_samples=NUM_SAMPLES, rho_b_db_list=RHO_B_DB_LIST, rho_edg
     return res
 
 
-def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None)):
-    # (rho_b, eps) 조합별 작은 그림 (a), (b), ...: 가로축 rho_e, 범례는 그림 위에 한 줄 (모든 작은 그림에 공통)
+FIG_SIZE_CM = (15.9, 11.5)   # 원고에 넣을 크기 그대로 그림 (가로 = 본문 폭). 100%로 넣으면 글자 크기가 유지됨
+FIG_DPI = 600                 # 저장 해상도
+FIG_FILES = ("fig6_1_est.png", "fig6_2_phi.png")   # plot_results가 저장하는 파일 (현재 폴더)
+FIG_STYLE = {"mathtext.fontset": "stix",           # 수식 기호 서체 (rho, phi, epsilon 등)
+             "font.size": 8, "axes.titlesize": 9, "axes.labelsize": 8,
+             "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8}
+
+
+def _plot_grid(res, key, schemes, ylabel, rho_b_db_list, eps_list, ylim=(0, None), sharey="row"):
+    # (rho_b, eps) 조합별 작은 그림 (a), (b), ...: 행 = rho_b, 열 = eps, 가로축 rho_e
+    # - 가로축은 모든 작은 그림이 공유, 세로축은 sharey에 따라 공유 ("row": 같은 rho_b끼리)
+    # - 축 이름과 범례는 그림 전체에 하나씩, 눈금 숫자는 모든 작은 그림에 표시
     nr, nc = len(rho_b_db_list), len(eps_list)
-    fig, axs = plt.subplots(nr, nc, figsize=(6.5 * nc, 4.8 * nr), squeeze=False)
+    fig, axs = plt.subplots(nr, nc, figsize=(FIG_SIZE_CM[0] / 2.54, FIG_SIZE_CM[1] / 2.54),
+                            sharex=True, sharey=sharey, squeeze=False)
     for i, rb_db in enumerate(rho_b_db_list):
         for j, eps in enumerate(eps_list):
             ax, r = axs[i, j], res[(rb_db, eps)]
             for k in schemes:
                 label, color, style = SCHEME_STYLE[k]
-                ax.plot(r["rho_edge"], r[f"{key}_{k}"], style, color=color, label=label, linewidth=1.6,
-                        markersize=6, markerfacecolor="none", markeredgewidth=1.4)
+                ax.plot(r["rho_edge"], r[f"{key}_{k}"], style, color=color, label=label, linewidth=1.0,
+                        markersize=3.5, markerfacecolor="none", markeredgewidth=0.9)
             ax.set_title(f"({'abcdefgh'[i * nc + j]}) $\\rho_b$ = {rb_db} dB, $\\varepsilon$ = {eps}")
-            ax.set_xlabel(RHO_E_LABEL)
-            ax.set_ylabel(ylabel)
-            ax.set_ylim(*ylim)                                              # 세로축 0에서 시작 (비율이 그대로 읽히도록)
-            lo, hi = ax.get_ylim()
-            ax.set_ylim(lo - 0.03 * (hi - lo), hi)                          # 0 근처 곡선이 가로축 선에 묻히지 않도록 아래쪽 여백 3%
+            ax.set_xticks(np.arange(-20, 21, 10))
+            ax.tick_params(labelbottom=True, labelleft=True)                 # 공유 축이어도 눈금 숫자는 모두 표시
             ax.grid(True, linestyle=":", alpha=0.7)
+            ax.set_ylim(*ylim)                                              # 세로축 0에서 시작 (비율이 그대로 읽히도록)
+    done = set()
+    for ax in axs.flat:                                                     # 아래쪽 여백 3%: 공유된 축 묶음마다 한 번만 적용
+        group = tuple(sorted(id(a) for a in ax.get_shared_y_axes().get_siblings(ax)))
+        if group not in done:
+            done.add(group)
+            lo, hi = ax.get_ylim()
+            ax.set_ylim(lo - 0.03 * (hi - lo), hi)                          # 0 근처 곡선이 가로축 선에 묻히지 않도록
     handles, labels = axs[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=len(schemes), frameon=False)
+    fig.supxlabel(RHO_E_LABEL, fontsize=FIG_STYLE["axes.labelsize"])
+    fig.supylabel(ylabel, fontsize=FIG_STYLE["axes.labelsize"])
     fig.tight_layout(rect=(0, 0, 1, 0.95))                                  # 위쪽은 범례 자리
     return fig
 
 
-def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST):
-    plt.rcParams["mathtext.fontset"] = "stix"                               # 수식 기호 서체 (rho, phi, epsilon 등)
+def plot_results(res, rho_b_db_list=RHO_B_DB_LIST, eps_list=EPS_LIST, save=True):
+    plt.rcParams.update(FIG_STYLE)
 
     # ===== (1) rho_edge에 따른 유효 보안 처리량 (그림 6.1) =====
-    _plot_grid(res, "eta", PLOT_SCHEMES, "Effective Secrecy Throughput, $\\overline{R}_s$ (bps/Hz)",
-               rho_b_db_list, eps_list)
+    fig_est = _plot_grid(res, "eta", PLOT_SCHEMES, "Effective Secrecy Throughput, $\\overline{R}_s$ (bps/Hz)",
+                         rho_b_db_list, eps_list)
 
     # ===== (2) rho_edge에 따른 평균 phi (전송 블록 기준) =====
-    _plot_grid(res, "phi", ("genie", "proposed", "agnostic"), "Average $\\phi$ (transmitted blocks)",
-               rho_b_db_list, eps_list, ylim=(0, 1))
+    fig_phi = _plot_grid(res, "phi", ("genie", "proposed", "agnostic"), "Average $\\phi$ (transmitted blocks)",
+                         rho_b_db_list, eps_list, ylim=(0, 1), sharey=True)
+    if save:
+        for fig, name in zip((fig_est, fig_phi), FIG_FILES):
+            fig.savefig(name, dpi=FIG_DPI)
     plt.show()
 
 
